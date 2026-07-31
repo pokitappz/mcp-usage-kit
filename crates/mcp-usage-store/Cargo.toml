@@ -1,0 +1,34 @@
+[package]
+name = "mcp-usage-store"
+description = "Distributed task-attribution stores for UsageKit for MCP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/mcp-usage-store"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+postgres = ["dep:sqlx", "dep:tokio"]
+redis = ["dep:redis", "dep:serde_json", "dep:tokio"]
+
+[dependencies]
+mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
+mcp-usage-tower = { version = "0.1.0", path = "../mcp-usage-tower" }
+redis = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

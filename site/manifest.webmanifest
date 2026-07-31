@@ -1,0 +1,16 @@
+{
+  "name": "UsageKit for MCP",
+  "short_name": "UsageKit",
+  "description": "Correct usage attribution for Rust MCP servers.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0d1b15",
+  "theme_color": "#0d1b15",
+  "icons": [
+    {
+      "src": "assets/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

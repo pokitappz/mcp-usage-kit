@@ -1,0 +1,212 @@
+use std::time::Duration;
+use std::{future::Future, result::Result as StdResult};
+
+use mcp_usage_core::{Call, Method};
+use mcp_usage_tower::{TaskAttributionStore, TaskStoreError, TaskStoreFuture};
+use sqlx::PgPool;
+
+use crate::{StoreConfigError, identifier_hash};
+
+const INSTALL_SQL: &str = include_str!("../schema/postgres.sql");
+const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `PostgreSQL` durable-task attribution with atomic, once-only claims.
+#[derive(Clone)]
+pub struct PostgresTaskStore {
+    pool: PgPool,
+    ttl_seconds: i64,
+    operation_timeout: Duration,
+}
+
+impl std::fmt::Debug for PostgresTaskStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresTaskStore")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .field("operation_timeout", &self.operation_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresTaskStore {
+    /// Construct a store from an application-owned connection pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreConfigError::InvalidTtl`] when the TTL is zero or cannot
+    /// be represented by `PostgreSQL`'s signed interval input.
+    pub fn new(pool: PgPool, ttl: Duration) -> Result<Self, StoreConfigError> {
+        Self::with_timeout(pool, ttl, DEFAULT_OPERATION_TIMEOUT)
+    }
+
+    /// Construct a store with an explicit bound for every database operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for an invalid TTL or zero timeout.
+    pub fn with_timeout(
+        pool: PgPool,
+        ttl: Duration,
+        operation_timeout: Duration,
+    ) -> Result<Self, StoreConfigError> {
+        let ttl_seconds = i64::try_from(ttl.as_secs()).map_err(|_| StoreConfigError::InvalidTtl)?;
+        if ttl_seconds == 0 {
+            return Err(StoreConfigError::InvalidTtl);
+        }
+        if operation_timeout.is_zero() {
+            return Err(StoreConfigError::InvalidTimeout);
+        }
+        Ok(Self {
+            pool,
+            ttl_seconds,
+            operation_timeout,
+        })
+    }
+
+    /// Install the idempotent table and expiry index.
+    ///
+    /// Applications with migration-controlled schemas can apply
+    /// `schema/postgres.sql` themselves and skip this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized schema error without exposing connection details.
+    pub async fn install(&self) -> Result<(), StoreConfigError> {
+        tokio::time::timeout(
+            self.operation_timeout,
+            sqlx::raw_sql(INSTALL_SQL).execute(&self.pool),
+        )
+        .await
+        .map_err(|_| StoreConfigError::Schema)?
+        .map_err(|_| StoreConfigError::Schema)?;
+        Ok(())
+    }
+
+    /// Delete expired task origins and return the affected row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized backend error.
+    pub async fn prune_expired(&self) -> Result<u64, TaskStoreError> {
+        self.run(
+            sqlx::query("DELETE FROM mcp_usage_task_attribution WHERE expires_at <= NOW()")
+                .execute(&self.pool),
+        )
+        .await
+        .map(|result| result.rows_affected())
+    }
+
+    async fn run<T, F>(&self, operation: F) -> Result<T, TaskStoreError>
+    where
+        F: Future<Output = StdResult<T, sqlx::Error>>,
+    {
+        tokio::time::timeout(self.operation_timeout, operation)
+            .await
+            .map_err(|_| TaskStoreError::BackendUnavailable)?
+            .map_err(|_| TaskStoreError::BackendUnavailable)
+    }
+}
+
+impl TaskAttributionStore for PostgresTaskStore {
+    fn insert<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        task_id: &'a str,
+        call: Call,
+    ) -> TaskStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.run(
+                sqlx::query(
+                    "INSERT INTO mcp_usage_task_attribution \
+                 (tenant_hash, task_hash, method, name, expires_at) \
+                 VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second')) \
+                 ON CONFLICT (tenant_hash, task_hash) DO NOTHING",
+                )
+                .bind(identifier_hash(tenant_id).to_vec())
+                .bind(identifier_hash(task_id).to_vec())
+                .bind(call.method.as_str())
+                .bind(call.name)
+                .bind(self.ttl_seconds)
+                .execute(&self.pool),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        task_id: &'a str,
+    ) -> TaskStoreFuture<'a, Option<Call>> {
+        Box::pin(async move {
+            let row: Option<(String, Option<String>)> = self
+                .run(
+                    sqlx::query_as(
+                        "SELECT method, name FROM mcp_usage_task_attribution \
+                 WHERE tenant_hash = $1 AND task_hash = $2 AND expires_at > NOW()",
+                    )
+                    .bind(identifier_hash(tenant_id).to_vec())
+                    .bind(identifier_hash(task_id).to_vec())
+                    .fetch_optional(&self.pool),
+                )
+                .await?;
+            Ok(row.map(|(method, name)| Call::new(Method::parse(&method), name)))
+        })
+    }
+
+    fn claim<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        task_id: &'a str,
+    ) -> TaskStoreFuture<'a, Option<Call>> {
+        Box::pin(async move {
+            let row: Option<(String, Option<String>)> = self
+                .run(
+                    sqlx::query_as(
+                        "DELETE FROM mcp_usage_task_attribution \
+                 WHERE tenant_hash = $1 AND task_hash = $2 AND expires_at > NOW() \
+                 RETURNING method, name",
+                    )
+                    .bind(identifier_hash(tenant_id).to_vec())
+                    .bind(identifier_hash(task_id).to_vec())
+                    .fetch_optional(&self.pool),
+                )
+                .await?;
+            Ok(row.map(|(method, name)| Call::new(Method::parse(&method), name)))
+        })
+    }
+
+    fn remove<'a>(&'a self, tenant_id: &'a str, task_id: &'a str) -> TaskStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.run(
+                sqlx::query(
+                    "DELETE FROM mcp_usage_task_attribution \
+                 WHERE tenant_hash = $1 AND task_hash = $2",
+                )
+                .bind(identifier_hash(tenant_id).to_vec())
+                .bind(identifier_hash(task_id).to_vec())
+                .execute(&self.pool),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn rejects_zero_operation_timeout_without_contacting_postgres() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://usagekit:usagekit@127.0.0.1/usagekit")
+            .unwrap();
+        let error = PostgresTaskStore::with_timeout(pool, Duration::from_secs(60), Duration::ZERO)
+            .unwrap_err();
+
+        assert_eq!(error, StoreConfigError::InvalidTimeout);
+    }
+}

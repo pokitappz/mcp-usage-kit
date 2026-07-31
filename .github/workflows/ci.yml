@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, test, document, and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Lint all targets and features
+        run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test all targets and features
+        run: cargo +stable test --workspace --all-targets --all-features --locked
+      - name: Treat documentation warnings as errors
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --workspace --all-features --no-deps --locked
+      - name: Build publishable archives
+        run: cargo +stable package --workspace --locked
+
+  msrv:
+    name: Rust 1.88 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the minimum supported Rust version
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Check the workspace
+        run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+
+  portability:
+    name: Check ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Check every crate
+        run: cargo +stable check --workspace --all-targets --all-features --locked
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-audit
+        run: cargo +stable install cargo-audit --locked --version 0.22.2
+      - name: Check RustSec advisories
+        run: cargo +stable audit
+
+  site:
+    name: Static site checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check JavaScript syntax
+        run: |
+          node --check site/app.js
+          node --check scripts/check-site.mjs
+      - name: Check site assets and internal links
+        run: node scripts/check-site.mjs

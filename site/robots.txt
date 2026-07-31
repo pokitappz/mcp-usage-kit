@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://pokitappz.github.io/mcp-usage-kit/sitemap.xml

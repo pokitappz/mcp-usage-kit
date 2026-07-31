@@ -1,0 +1,43 @@
+[package]
+name = "mcp-usage-kit"
+description = "Protocol-correct usage accounting for rmcp Streamable HTTP servers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/mcp-usage-kit"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+opentelemetry = ["mcp-usage-tower/opentelemetry"]
+postgres = ["dep:mcp-usage-store", "mcp-usage-store/postgres"]
+redis = ["dep:mcp-usage-store", "mcp-usage-store/redis"]
+stripe = ["mcp-usage-export/stripe"]
+
+[dependencies]
+mcp-usage-export = { version = "0.1.0", path = "../mcp-usage-export" }
+mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
+mcp-usage-tower = { version = "0.1.0", path = "../mcp-usage-tower" }
+mcp-usage-store = { version = "0.1.0", path = "../mcp-usage-store", optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }

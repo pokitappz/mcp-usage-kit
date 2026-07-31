@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "complete-tool-is-billable",
+      "method": "tools/call",
+      "name": "search",
+      "flatUnits": 3,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[]}},
+      "expected": {"kind":"billable","units":3}
+    },
+    {
+      "id": "interim-input-is-free",
+      "method": "tools/call",
+      "name": "search",
+      "flatUnits": 3,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"input_required","requestState":"opaque"}},
+      "expected": {"kind":"free","reason":"interim_input_required"}
+    },
+    {
+      "id": "protocol-error-is-free",
+      "method": "tools/call",
+      "name": "search",
+      "flatUnits": 3,
+      "response": {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"failed"}},
+      "expected": {"kind":"free","reason":"protocol_error"}
+    },
+    {
+      "id": "task-creation-is-free",
+      "method": "tools/call",
+      "name": "report",
+      "flatUnits": 8,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"task","taskId":"task-1","status":"working"}},
+      "expected": {"kind":"free","reason":"task_created"}
+    },
+    {
+      "id": "working-task-poll-is-free",
+      "method": "tasks/get",
+      "flatUnits": 8,
+      "response": {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"working"}},
+      "taskOrigin": {"method":"tools/call","name":"report"},
+      "expected": {"kind":"free","reason":"task_in_progress"}
+    },
+    {
+      "id": "completed-task-uses-origin-price",
+      "method": "tasks/get",
+      "flatUnits": 1,
+      "namedUnits": {"report": 25},
+      "response": {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"task-1","status":"completed","result":{}}},
+      "taskOrigin": {"method":"tools/call","name":"report"},
+      "expected": {"kind":"billable","units":25,"idempotencyKey":"task-1"}
+    },
+    {
+      "id": "completed-task-without-origin-is-free",
+      "method": "tasks/get",
+      "flatUnits": 8,
+      "response": {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"task-1","status":"completed","result":{}}},
+      "expected": {"kind":"free","reason":"missing_task_attribution"}
+    },
+    {
+      "id": "completed-task-without-id-is-free",
+      "method": "tasks/get",
+      "flatUnits": 8,
+      "response": {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","status":"completed","result":{}}},
+      "taskOrigin": {"method":"tools/call","name":"report"},
+      "expected": {"kind":"free","reason":"missing_task_id"}
+    },
+    {
+      "id": "failed-task-is-free",
+      "method": "tasks/get",
+      "flatUnits": 8,
+      "response": {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"task-1","status":"failed"}},
+      "taskOrigin": {"method":"tools/call","name":"report"},
+      "expected": {"kind":"free","reason":"task_not_delivered"}
+    },
+    {
+      "id": "discovery-is-free",
+      "method": "tools/list",
+      "flatUnits": 9,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[]}},
+      "expected": {"kind":"free","reason":"discovery"}
+    },
+    {
+      "id": "subscription-is-free",
+      "method": "subscriptions/listen",
+      "flatUnits": 9,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}},
+      "expected": {"kind":"free","reason":"subscription"}
+    },
+    {
+      "id": "unknown-result-fails-free",
+      "method": "tools/call",
+      "name": "search",
+      "flatUnits": 3,
+      "response": {"jsonrpc":"2.0","id":1,"result":{"resultType":"vendor_extension"}},
+      "expected": {"kind":"free","reason":"unrecognized_result"}
+    }
+  ]
+}
