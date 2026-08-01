@@ -25,7 +25,7 @@ jobs:
     name: Format, lint, test, document, and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Check formatting
@@ -45,7 +45,7 @@ jobs:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the minimum supported Rust version
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Check the workspace
@@ -59,7 +59,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Check every crate
@@ -69,7 +69,7 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install cargo-audit
@@ -81,7 +81,7 @@ jobs:
     name: License, source, and ban checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install cargo-deny
@@ -93,7 +93,7 @@ jobs:
     name: Fuzz targets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # libFuzzer needs nightly, which is why `fuzz/` declares its own workspace
       # and stays out of every ordinary build. This job exists so the targets
       # cannot rot: property tests on stable are the actual gate, but a fuzz
@@ -142,7 +142,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Exercise the durable task stores
@@ -159,7 +159,7 @@ jobs:
     name: Static site checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check JavaScript syntax
         run: |
           node --check site/app.js
