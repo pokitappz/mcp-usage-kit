@@ -45,6 +45,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- A checked-in administrator script configures every CI job as required before
+  `main` can advance, makes release tags immutable, and review-gates the release
+  environment. The publish workflow independently verifies that a version tag
+  points to a commit already on `main`.
 - Both static pages declare restrictive Content Security Policies. The 404 page
   no longer embeds CSS, and site checks reject inline executable content.
 - CI backend images are pinned by digest as well as version. First-release

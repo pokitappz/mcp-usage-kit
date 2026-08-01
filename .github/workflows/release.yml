@@ -15,11 +15,29 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
+      - name: Verify release commit provenance
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          release_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$release_commit" != "$GITHUB_SHA" ]]; then
+            echo "Release tag does not resolve to the workflow commit" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main; then
+            echo "Release commit is not reachable from origin/main" >&2
+            exit 1
+          fi
       - name: Verify release tag and workspace version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_BASE_REF: refs/remotes/origin/main
         run: bash scripts/check-release-version.sh
       - name: Test the release
         run: cargo +stable test --workspace --all-targets --all-features --locked
