@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Integration tests exercising the Redis and `PostgreSQL` task stores against
+  real backends, covering the invariants billing correctness rests on: a task
+  origin is immutable once captured, a completed task can be claimed exactly
+  once under concurrent contention, records are isolated per tenant, and
+  abandoned records expire. Each backend is skipped unless its URL is present in
+  the environment, so `cargo test` stays green without a database; CI sets
+  `MCP_USAGE_REQUIRE_BACKENDS=1` so a broken service container fails instead of
+  silently skipping.
+
+### Fixed
+
+- `PostgresTaskStore::install` is now safe to call concurrently. `CREATE TABLE
+  IF NOT EXISTS` is not atomic in `PostgreSQL`: racing sessions each consult the
+  catalog, all conclude the table is absent, and every loser fails with a
+  duplicate key violation on `pg_type_typname_nsp_index`. Every instance of a
+  horizontally scaled application calls this on boot, and they boot together, so
+  all but one would fail to start. A transaction-scoped advisory lock now
+  serializes the check.
+
+- Terminal accounting now also runs when the response body is dropped, not only
+  when it is polled to end-of-stream. A transport is not obliged to make that
+  final poll, and hyper stops as soon as the bytes declared by `Content-Length`
+  have been written, which is the ordinary case for a fixed-length JSON result.
+  As a result billing, cache insertion, and durable-task attribution silently did
+  nothing behind Axum, Hyper, and `rmcp`: three billable `tools/call` requests
+  recorded `classified=3` but `billed=0`. The completion future is polled once
+  with a no-op waker, which covers synchronous recorders and the default
+  in-memory task store; a task store performing real I/O that cannot complete
+  synchronously increments `record_failures` instead of being dropped silently.
+
 ### Security
 
 - Results the origin marks `cacheScope: "public"` are no longer shared across

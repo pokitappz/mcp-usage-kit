@@ -7,7 +7,25 @@ use sqlx::PgPool;
 
 use crate::{StoreConfigError, identifier_hash};
 
-const INSTALL_SQL: &str = include_str!("../schema/postgres.sql");
+/// Schema installation, serialized by a transaction-scoped advisory lock.
+///
+/// `CREATE TABLE IF NOT EXISTS` is not atomic in `PostgreSQL`. Racing sessions
+/// each consult the catalog, all conclude the table is absent, and every loser
+/// fails with a duplicate key violation on `pg_type_typname_nsp_index`. Taking
+/// an advisory lock first serializes the check, so late arrivals find the table
+/// already present and do nothing.
+///
+/// `sqlx::raw_sql` uses the simple query protocol, which `PostgreSQL` executes as
+/// a single implicit transaction. The lock is therefore held across the DDL and
+/// released at commit, with no explicit transaction object to thread through.
+///
+/// The lock key is an arbitrary but stable constant, assembled at compile time.
+/// It only needs to be distinct from other advisory locks the host application
+/// takes on the same database.
+const INSTALL_SQL: &str = concat!(
+    "SELECT pg_advisory_xact_lock(7594834021775991);\n",
+    include_str!("../schema/postgres.sql")
+);
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `PostgreSQL` durable-task attribution with atomic, once-only claims.
@@ -64,6 +82,14 @@ impl PostgresTaskStore {
     }
 
     /// Install the idempotent table and expiry index.
+    ///
+    /// Safe to call concurrently from every instance of a horizontally scaled
+    /// application, which is the situation this store exists for. `CREATE TABLE
+    /// IF NOT EXISTS` is *not* atomic in `PostgreSQL`: racing sessions check the
+    /// catalog, all decide the table is absent, and every loser fails with a
+    /// duplicate key violation on `pg_type_typname_nsp_index`. A transaction
+    /// scoped advisory lock serializes the check so late arrivals simply find
+    /// the table already present and do nothing.
     ///
     /// Applications with migration-controlled schemas can apply
     /// `schema/postgres.sql` themselves and skip this operation.

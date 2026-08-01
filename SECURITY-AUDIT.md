@@ -265,21 +265,43 @@ Stated plainly, so deployers can make their own call:
 
 ---
 
-## Non-security observation
+## Non-security defect found while verifying H1 (fixed)
 
-While verifying H1 over real HTTP, a throwaway Axum server behind `MeterLayer`
-returned a cacheable `tools/list` result with `ttlMs` and `cacheScope` set, and
-**no response was ever served from cache** — not across tenants, and not even for
-repeated requests from the same credential. The origin was reached every time.
+Verifying H1 over real HTTP surfaced a separate and more serious bug, which is
+recorded here because the audit is what found it.
 
-This is **not** caused by any change in this audit. The same behavior was
-confirmed by stashing every source change and re-running against the original
-code, which cached no more than the patched version did. It is also not a
-security defect: not caching fails in the safe direction, since an entry that is
-never served can never be served to the wrong tenant.
+A server behind `MeterLayer` never served anything from cache, not across tenants
+and not even for repeated requests on the same credential. Instrumenting the
+metrics showed why: for three billable `tools/call` requests the layer reported
+`classified=3` but `billed=0`, `free=0`, and `unrecognized=0`. All three terminal
+counters at zero meant `Completion::finish` was never entered at all, so
+**billing, cache insertion, and durable-task attribution were silently doing
+nothing.**
 
-It is recorded here because it is a real functional gap worth investigating
-separately. Caching is exercised and passing at both the cache unit level and
-through the Tower stack in `crates/mcp-usage-tower/src/layer.rs` tests, so
-whatever the cause, it lies in the Axum integration path rather than in the cache
-logic itself.
+The cause was that terminal accounting lived only in the `Poll::Ready(None)` arm
+of `ObservedBody::poll_frame`. A transport is not obliged to poll a body to
+end-of-stream, and hyper stops as soon as the bytes declared by `Content-Length`
+have been written, which is the ordinary case for a fixed-length JSON result.
+Removing `Content-Length` so the response was chunked produced `billed=3`,
+confirming the mechanism. Withholding `is_end_stream` did not help, because hyper
+stops on the byte count rather than the flag.
+
+The test suite could not catch this: every test consumed bodies through
+`BodyExt::collect`, which always polls to `None` and therefore guarantees an arm
+that no real transport guarantees.
+
+Accounting now also runs when the body is dropped, which is the one signal every
+transport gives. The completion future is polled once with a no-op waker, which
+is sufficient for synchronous recorders and for the default in-memory task store,
+whose futures never yield. A store performing real I/O may still be pending; that
+case increments `record_failures` rather than passing silently. Two regression
+tests cover it: one drives a body by hand and drops it without ever observing
+end-of-stream, and one asserts a fully consumed body is still accounted for
+exactly once.
+
+This was not a security defect on its own. It failed in the safe direction, since
+an entry that is never cached cannot be served to the wrong tenant. Its relevance
+to this audit is the reverse: fixing it is what makes the cache reachable, so the
+H1 isolation controls became load-bearing only after this change. Cross-tenant
+isolation was re-verified over real HTTP afterwards, with a second tenant still
+reaching the origin rather than receiving the first tenant's cached body.

@@ -89,6 +89,48 @@ jobs:
       - name: Check licenses, sources, bans, and advisories
         run: cargo +stable deny --all-features check
 
+  backends:
+    name: Redis and PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      # Pinned to explicit minor versions rather than a floating tag, so a
+      # backend upgrade is a reviewed change rather than a surprise.
+      postgres:
+        image: postgres:17.2
+        env:
+          POSTGRES_USER: usagekit
+          POSTGRES_PASSWORD: usagekit
+          POSTGRES_DB: usagekit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Exercise the durable task stores
+        env:
+          MCP_USAGE_TEST_POSTGRES_URL: postgres://usagekit:usagekit@127.0.0.1:5432/usagekit
+          MCP_USAGE_TEST_REDIS_URL: redis://127.0.0.1:6379
+          # Without this a broken service container would look exactly like a
+          # passing run, because the tests skip themselves when a backend is
+          # absent.
+          MCP_USAGE_REQUIRE_BACKENDS: "1"
+        run: cargo +stable test -p mcp-usage-store --all-features --locked --test backends
+
   site:
     name: Static site checks
     runs-on: ubuntu-latest
