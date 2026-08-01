@@ -119,6 +119,21 @@ impl InMemoryTaskStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    fn compact_order_if_needed(&self, state: &mut TaskState) {
+        if state.insertion_order.len() > self.max_tasks.saturating_mul(2) {
+            let TaskState {
+                tasks,
+                insertion_order,
+                ..
+            } = state;
+            insertion_order.retain(|(queued, generation)| {
+                tasks
+                    .get(queued)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+        }
+    }
 }
 
 impl TaskAttributionStore for InMemoryTaskStore {
@@ -186,13 +201,15 @@ impl TaskAttributionStore for InMemoryTaskStore {
     ) -> TaskStoreFuture<'a, Option<Call>> {
         Box::pin(async move {
             let key = (tenant_id.to_owned(), task_id.to_owned());
-            Ok(self
+            let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tasks
-                .remove(&key)
-                .map(|entry| entry.call))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let claimed = state.tasks.remove(&key).map(|entry| entry.call);
+            if claimed.is_some() {
+                self.compact_order_if_needed(&mut state);
+            }
+            Ok(claimed)
         })
     }
 
@@ -204,18 +221,7 @@ impl TaskAttributionStore for InMemoryTaskStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.tasks.remove(&key);
-            if state.insertion_order.len() > self.max_tasks.saturating_mul(2) {
-                let TaskState {
-                    tasks,
-                    insertion_order,
-                    ..
-                } = &mut *state;
-                insertion_order.retain(|(queued, generation)| {
-                    tasks
-                        .get(queued)
-                        .is_some_and(|entry| entry.generation == *generation)
-                });
-            }
+            self.compact_order_if_needed(&mut state);
             Ok(())
         })
     }
@@ -266,5 +272,22 @@ mod tests {
         let store = InMemoryTaskStore::with_capacity(0);
         store.insert("tenant", "task", call("tool")).await.unwrap();
         assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_insert_and_claim_cycles_bound_ordering_metadata() {
+        let capacity = 4;
+        let store = InMemoryTaskStore::with_capacity(capacity);
+        for index in 0..100 {
+            let task_id = format!("task-{index}");
+            store
+                .insert("tenant", &task_id, call("tool"))
+                .await
+                .unwrap();
+            assert!(store.claim("tenant", &task_id).await.unwrap().is_some());
+            let state = store.state.lock().unwrap();
+            assert!(state.tasks.len() <= capacity);
+            assert!(state.insertion_order.len() <= capacity * 2);
+        }
     }
 }

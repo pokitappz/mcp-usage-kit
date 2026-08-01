@@ -13,7 +13,7 @@ const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct RedisTaskStore {
     connection: redis::aio::ConnectionManager,
     key_prefix: String,
-    ttl_seconds: u64,
+    ttl_seconds: i64,
 }
 
 impl std::fmt::Debug for RedisTaskStore {
@@ -57,7 +57,7 @@ impl RedisTaskStore {
         if !valid_prefix(&key_prefix) {
             return Err(StoreConfigError::InvalidPrefix);
         }
-        let ttl_seconds = ttl.as_secs();
+        let ttl_seconds = i64::try_from(ttl.as_secs()).map_err(|_| StoreConfigError::InvalidTtl)?;
         if ttl_seconds == 0 {
             return Err(StoreConfigError::InvalidTtl);
         }
@@ -193,5 +193,19 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, StoreConfigError::InvalidTimeout);
+    }
+
+    #[tokio::test]
+    async fn rejects_ttl_larger_than_redis_signed_integer_before_connecting() {
+        let oversized = u64::try_from(i64::MAX).unwrap() + 1;
+        let error = RedisTaskStore::connect(
+            "redis://127.0.0.1:1/",
+            "usagekit:tasks",
+            Duration::from_secs(oversized),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, StoreConfigError::InvalidTtl);
     }
 }

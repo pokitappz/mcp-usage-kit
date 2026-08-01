@@ -14,9 +14,9 @@
 //!
 //! So the unfinished future is parked here instead, and driven later from a
 //! context that can await. Two things drive it, deliberately: every subsequent
-//! request drains a bounded number, so an application that does nothing still
-//! converges, and [`DeferredCompletions::drain`] empties the queue on demand for
-//! timeliness and for shutdown.
+//! authenticated request drains a bounded number, so an application that does
+//! nothing still converges, and [`DeferredCompletions::drain`] empties the queue
+//! on demand for timeliness and for shutdown.
 //!
 //! Parking never allocates a runtime and never spawns, which is what keeps this
 //! crate runtime agnostic.
@@ -73,7 +73,7 @@ impl DeferredCompletions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.capacity == 0 {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.record_drop();
             return false;
         }
         let mut evicted = false;
@@ -83,39 +83,75 @@ impl DeferredCompletions {
         }
         queue.push_back(completion);
         if evicted {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.record_drop();
         }
         !evicted
     }
 
-    fn take(&self, limit: usize) -> Vec<Parked> {
+    fn take_one(&self) -> Option<Parked> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+
+    fn requeue_in_flight(&self, completion: Parked) {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = limit.min(queue.len());
-        queue.drain(..count).collect()
+        if self.capacity == 0 {
+            self.record_drop();
+            return;
+        }
+        if queue.len() >= self.capacity {
+            queue.pop_back();
+            self.record_drop();
+        }
+        queue.push_front(completion);
+    }
+
+    fn record_drop(&self) {
+        let mut current = self.dropped.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(1);
+            if next == current {
+                return;
+            }
+            match self.dropped.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Run at most `limit` parked completions, returning how many ran.
     ///
-    /// Entries are removed from the queue before being awaited, so a caller that
-    /// is cancelled part way through drops the completions it had taken rather
-    /// than leaving them to be run twice.
+    /// Entries are processed one at a time. If this drain is cancelled while a
+    /// completion is pending, a drop guard returns that exact future to the
+    /// front of the queue for a later drain.
     pub async fn drain_some(&self, limit: usize) -> usize {
-        let taken = self.take(limit);
-        let count = taken.len();
-        for completion in taken {
-            completion.await;
+        let mut completed = 0;
+        while completed < limit {
+            let Some(completion) = self.take_one() else {
+                break;
+            };
+            InFlight::new(self, completion).run().await;
+            completed += 1;
         }
-        count
+        completed
     }
 
     /// Run every parked completion, returning how many ran.
     ///
-    /// Call this from the same loop that flushes billing, and once more on
-    /// shutdown, so durable-task accounting is not left behind by a process that
-    /// is about to exit.
+    /// Call this from the same loop that flushes billing, and once more after
+    /// graceful shutdown, so durable-task accounting is not left behind by a
+    /// process that is about to exit.
     pub async fn drain(&self) -> usize {
         let mut total = 0;
         loop {
@@ -123,7 +159,7 @@ impl DeferredCompletions {
             if ran == 0 {
                 return total;
             }
-            total += ran;
+            total = total.saturating_add(ran);
         }
     }
 
@@ -152,11 +188,65 @@ impl DeferredCompletions {
     }
 }
 
+struct InFlight<'a> {
+    deferred: &'a DeferredCompletions,
+    completion: Option<Parked>,
+}
+
+impl<'a> InFlight<'a> {
+    fn new(deferred: &'a DeferredCompletions, completion: Parked) -> Self {
+        Self {
+            deferred,
+            completion: Some(completion),
+        }
+    }
+
+    async fn run(mut self) {
+        if let Some(completion) = self.completion.as_mut() {
+            completion.as_mut().await;
+        }
+        self.completion = None;
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            if std::thread::panicking() {
+                self.deferred.record_drop();
+            } else {
+                self.deferred.requeue_in_flight(completion);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    struct PendingUntilAllowed {
+        polls: Arc<AtomicUsize>,
+        allowed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Future for PendingUntilAllowed {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.allowed.load(Ordering::Relaxed) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
 
     fn counting(counter: &Arc<AtomicUsize>) -> Parked {
         let counter = Arc::clone(counter);
@@ -225,5 +315,32 @@ mod tests {
         let deferred = DeferredCompletions::new(4);
         assert_eq!(deferred.drain().await, 0);
         assert_eq!(deferred.drain_some(10).await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_drain_requeues_the_in_flight_completion() {
+        let deferred = Arc::new(DeferredCompletions::new(4));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(deferred.park(Box::pin(PendingUntilAllowed {
+            polls: Arc::clone(&polls),
+            allowed: Arc::clone(&allowed),
+        })));
+
+        let drain = tokio::spawn({
+            let deferred = Arc::clone(&deferred);
+            async move { deferred.drain_some(1).await }
+        });
+        while polls.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        drain.abort();
+        assert!(drain.await.unwrap_err().is_cancelled());
+        assert_eq!(deferred.len(), 1);
+
+        allowed.store(true, Ordering::Relaxed);
+        assert_eq!(deferred.drain_some(1).await, 1);
+        assert!(deferred.is_empty());
+        assert_eq!(deferred.dropped(), 0);
     }
 }

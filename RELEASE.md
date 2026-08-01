@@ -9,7 +9,11 @@ All five crates share one version and are released together in dependency order.
    `Cargo.lock`.
 3. Move the relevant changelog entries from Unreleased into a dated version.
 4. Run the complete CI command set from `CONTRIBUTING.md`.
-5. Run `cargo package --workspace --locked` and inspect each generated archive.
+5. Run `cargo package --workspace --locked --no-verify` and inspect each
+   generated archive. Before the first release, verification cannot resolve the
+   workspace crates from crates.io. The dependency-ordered `cargo publish`
+   commands below perform full package verification once each prerequisite is
+   visible in the registry.
 
 ## First release
 

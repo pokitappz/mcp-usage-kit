@@ -36,10 +36,13 @@ pub use mcp_usage_export::{
     AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, FnExporter, LogExporter,
     NoopRecorder, RecordOutcome, SharedExporter, UsageEvent, UsageRecorder,
 };
+#[cfg(feature = "stripe")]
+pub use mcp_usage_export::{StripeDeadLetter, StripeDeadLetterReason, StripeExporter};
 pub use mcp_usage_tower::{
-    DeferredCompletions, EdgeConfig, EdgeMetrics, InMemoryTaskStore, InMemoryTenantStore,
-    MIN_API_KEY_BYTES, MeterLayer, MeterService, MetricsSnapshot, TaskAttributionStore,
-    TaskStoreError, TaskStoreFuture, Tenant, TenantStore, WeakApiKey, validate_api_key_strength,
+    DeferredCompletions, EdgeConfig, EdgeConfigError, EdgeMetrics, InMemoryTaskStore,
+    InMemoryTenantStore, MIN_API_KEY_BYTES, MeterLayer, MeterService, MetricsSnapshot,
+    TaskAttributionStore, TaskStoreError, TaskStoreFuture, Tenant, TenantStore, WeakApiKey,
+    validate_api_key_strength,
 };
 
 #[cfg(feature = "opentelemetry")]

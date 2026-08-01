@@ -17,6 +17,7 @@ use http_body_util::{BodyExt, Full};
 use mcp_usage_core::{Call, Charge, Method, ResultType, TaskStatus, decide_with_task_origin};
 use mcp_usage_export::{NoopRecorder, RecordOutcome, SharedRecorder, UsageEvent};
 use serde_json::{Value, json};
+use thiserror::Error;
 use tower::{Layer, Service};
 
 use crate::auth::{AuthFailureLimit, Tenant, TenantStore, hash_api_key};
@@ -42,6 +43,14 @@ const DEFAULT_DEFERRED_CAPACITY: usize = 4_096;
 /// to stay cheap; an application under load has no shortage of requests to
 /// amortize the backlog across.
 const DEFAULT_DEFERRED_DRAIN_PER_REQUEST: usize = 2;
+
+/// Invalid edge configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum EdgeConfigError {
+    /// Authentication failure windows must advance over time.
+    #[error("authentication failure window must be greater than zero")]
+    InvalidAuthFailureWindow,
+}
 
 /// Runtime configuration shared by every cloned metering service.
 #[derive(Clone)]
@@ -205,10 +214,10 @@ impl EdgeConfig {
     ///
     /// Only a durable task store parks anything: its futures perform real I/O,
     /// and the body is released from `Drop`, where nothing may await. Every
-    /// subsequent request runs a bounded number of them, so an application that
-    /// ignores this still converges. Draining explicitly is better, and draining
-    /// on shutdown is what stops a departing process from taking durable-task
-    /// charges with it.
+    /// subsequent authenticated request runs a bounded number of them, so an
+    /// application that ignores this still converges. Draining explicitly is
+    /// better, and draining after graceful shutdown is what stops a departing
+    /// process from taking durable-task charges with it.
     ///
     /// Take the handle before passing the configuration to the layer.
     #[must_use]
@@ -216,7 +225,7 @@ impl EdgeConfig {
         self.deferred.clone()
     }
 
-    /// Bound how much parked accounting each request runs.
+    /// Bound how much parked accounting each authenticated request runs.
     ///
     /// Zero leaves draining entirely to [`EdgeConfig::deferred`]. Raising it
     /// clears a backlog sooner at the cost of latency on the requests that do
@@ -244,10 +253,21 @@ impl EdgeConfig {
     /// This bounds sustained guessing across the whole edge. It is not
     /// per-client limiting, which needs a client identity this layer cannot
     /// trust, and belongs in the proxy in front of it.
-    #[must_use]
-    pub fn with_auth_failure_limit(mut self, max_failures: u64, window: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EdgeConfigError::InvalidAuthFailureWindow`] when `window` is
+    /// zero.
+    pub fn with_auth_failure_limit(
+        mut self,
+        max_failures: u64,
+        window: Duration,
+    ) -> Result<Self, EdgeConfigError> {
+        if window.is_zero() {
+            return Err(EdgeConfigError::InvalidAuthFailureWindow);
+        }
         self.auth_failure_limit = Some(Arc::new(AuthFailureLimit::new(max_failures, window)));
-        self
+        Ok(self)
     }
 }
 
@@ -312,16 +332,6 @@ where
         let config = self.config.clone();
 
         Box::pin(async move {
-            // Borrow this request to make progress on accounting a previous one
-            // could not finish. Bounded, so a backlog is amortized across
-            // traffic rather than charged to whichever request finds it.
-            if config.deferred_drain_per_request > 0 {
-                config
-                    .deferred
-                    .drain_some(config.deferred_drain_per_request)
-                    .await;
-            }
-
             let (mut parts, request_body) = request.into_parts();
             let protocol = match classify_request_headers(&parts.headers) {
                 Ok(protocol) => protocol,
@@ -347,6 +357,16 @@ where
             let Some(tenant) = config.tenants.authenticate(api_key) else {
                 return Ok(refuse_credential(&config, "invalid API key"));
             };
+
+            // Only authenticated traffic may borrow the request path to drive
+            // earlier backend work. Malformed headers and failed credentials
+            // return above without polling a deferred completion.
+            if config.deferred_drain_per_request > 0 {
+                config
+                    .deferred
+                    .drain_some(config.deferred_drain_per_request)
+                    .await;
+            }
             let authorization_context = hash_api_key(api_key);
             config.metrics.classified();
 
@@ -689,6 +709,19 @@ impl Completion {
                     Err(error) => {
                         self.config.metrics.record_failure();
                         tracing::error!(error = %error, "failed to buffer MCP usage");
+                        if let (Some(task_id), Some(origin)) = (response_task_id, task_origin)
+                            && let Err(store_error) = self
+                                .config
+                                .tasks
+                                .insert(&self.tenant.id, task_id, origin)
+                                .await
+                        {
+                            self.config.metrics.record_failure();
+                            tracing::error!(
+                                error = %store_error,
+                                "failed to restore MCP task attribution after recorder rejection"
+                            );
+                        }
                     }
                 }
             }
@@ -893,7 +926,10 @@ pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Valu
     if !has_media_type(content_type, "text/event-stream") {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?.replace("\r\n", "\n");
+    let text = std::str::from_utf8(bytes)
+        .ok()?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let mut terminal = None;
     for event in text.split("\n\n") {
         let data = event
@@ -962,8 +998,58 @@ mod tests {
     use super::*;
     use crate::{InMemoryTenantStore, Tenant};
     use mcp_usage_core::PriceBook;
-    use mcp_usage_export::{BillingPipeline, LogExporter};
+    use mcp_usage_export::{
+        AggregatedUsage, BatchExporter, BillingPipeline, ExportFuture, RecordError, UsageRecorder,
+    };
     use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+    #[derive(Debug, Default)]
+    struct CaptureExporter {
+        exported: std::sync::Mutex<Vec<AggregatedUsage>>,
+    }
+
+    impl CaptureExporter {
+        fn exported(&self) -> Vec<AggregatedUsage> {
+            self.exported
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl BatchExporter for CaptureExporter {
+        fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+            Box::pin(async move {
+                self.exported
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(batch);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RejectOnceRecorder {
+        rejected: std::sync::atomic::AtomicBool,
+        recorded: std::sync::Mutex<Vec<UsageEvent>>,
+    }
+
+    impl UsageRecorder for RejectOnceRecorder {
+        fn record(&self, event: UsageEvent) -> Result<RecordOutcome, RecordError> {
+            if !self
+                .rejected
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RecordError::Poisoned);
+            }
+            self.recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+            Ok(RecordOutcome::Recorded)
+        }
+    }
 
     fn request(method: &str, name: Option<&str>, body: &Value, key: &str) -> Request<Full<Bytes>> {
         let mut body = body.clone();
@@ -1220,6 +1306,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_and_unauthenticated_requests_do_not_poll_deferred_work() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let config = EdgeConfig::new(tenants);
+        let deferred = config.deferred();
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(deferred.park(Box::pin({
+            let polled = Arc::clone(&polled);
+            async move {
+                polled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        })));
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                })))
+            }));
+
+        let mut malformed = request("tools/list", None, &json!({"id":1,"params":{}}), "secret");
+        malformed.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            http::HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(
+            service.clone().oneshot(malformed).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(polled.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/list",
+                    None,
+                    &json!({"id":2,"params":{}}),
+                    "wrong",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(polled.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(deferred.len(), 1);
+
+        consume(
+            service
+                .oneshot(request(
+                    "tools/list",
+                    None,
+                    &json!({"id":3,"params":{}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(polled.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(deferred.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorder_rejection_restores_claimed_task_origin_for_a_later_poll() {
+        let tasks = Arc::new(InMemoryTaskStore::new());
+        let recorder = Arc::new(RejectOnceRecorder::default());
+        let metrics_config = EdgeConfig::new(task_tenants())
+            .with_task_store(tasks.clone())
+            .with_recorder(recorder.clone());
+        let metrics = metrics_config.metrics();
+        let service = task_lifecycle_service(metrics_config);
+
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/call",
+                    Some("long_job"),
+                    &json!({"id":1,"params":{"name":"long_job"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":2,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the rejected charge must restore its origin"
+        );
+        assert!(recorder.recorded.lock().unwrap().is_empty());
+
+        release_without_end_of_stream(
+            service
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":3,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(tasks.is_empty());
+        let captured = recorder.recorded.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].units, 50);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 1);
+        assert_eq!(snapshot.record_failures, 1);
+    }
+
+    #[tokio::test]
     async fn a_synchronous_store_never_parks_anything() {
         // The default in-process store answers without yielding, so the common
         // deployment must not pay for the queue at all.
@@ -1244,7 +1456,7 @@ mod tests {
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("expensive", 25)),
         );
-        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
         let service = ServiceBuilder::new()
             .layer(MeterLayer::new(config))
@@ -1340,7 +1552,7 @@ mod tests {
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("file:///report", 4)),
         );
-        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_calls = calls.clone();
         let service = ServiceBuilder::new()
@@ -1427,7 +1639,7 @@ mod tests {
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("long_job", 50)),
         );
-        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_stage = stage.clone();
         let service = ServiceBuilder::new()
@@ -1488,7 +1700,7 @@ mod tests {
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("expensive", 100)),
         );
-        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_stage = stage.clone();
         let service = ServiceBuilder::new()
@@ -1558,7 +1770,7 @@ mod tests {
             "secret",
             Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("tool", 7)),
         );
-        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
         let metrics = config.metrics();
         let service = ServiceBuilder::new()
@@ -1808,8 +2020,9 @@ mod tests {
     async fn sustained_guessing_is_refused_without_affecting_valid_keys() {
         let tenants = Arc::new(InMemoryTenantStore::new());
         tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
-        let config =
-            EdgeConfig::new(tenants).with_auth_failure_limit(3, std::time::Duration::from_secs(60));
+        let config = EdgeConfig::new(tenants)
+            .with_auth_failure_limit(3, std::time::Duration::from_secs(60))
+            .unwrap();
         let metrics = config.metrics();
         let service = ServiceBuilder::new()
             .layer(MeterLayer::new(config))
@@ -1909,12 +2122,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_authentication_failure_window_is_rejected() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        assert_eq!(
+            EdgeConfig::new(tenants)
+                .with_auth_failure_limit(3, Duration::ZERO)
+                .unwrap_err(),
+            EdgeConfigError::InvalidAuthFailureWindow
+        );
+    }
+
+    #[test]
     fn extracts_terminal_response_from_sse_without_confusing_notifications() {
         let stream = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n\
                        : keepalive\n\n\
                        data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"}}\n\n";
         let terminal = terminal_response("text/event-stream", stream).unwrap();
         assert_eq!(terminal["id"], 1);
+    }
+
+    #[test]
+    fn extracts_terminal_response_from_sse_with_mixed_line_endings() {
+        let stream = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\r\
+                       : keepalive\r\n\r\n\
+                       data: {\"jsonrpc\":\"2.0\",\"id\":7,\r\
+                       data: \"result\":{\"resultType\":\"complete\"}}\n\n";
+        let terminal = terminal_response("text/event-stream", stream).unwrap();
+        assert_eq!(terminal["id"], 7);
     }
 
     #[test]

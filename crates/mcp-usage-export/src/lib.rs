@@ -243,10 +243,27 @@ struct BufferState {
 }
 
 /// Thread-safe in-memory aggregator with bounded idempotency memory.
-#[derive(Debug)]
 pub struct UsageBuffer {
     state: Mutex<BufferState>,
     max_idempotency_keys: usize,
+}
+
+impl fmt::Debug for UsageBuffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        formatter
+            .debug_struct("UsageBuffer")
+            .field(
+                "pending_buckets",
+                &(state.pending.len() + state.retry.len()),
+            )
+            .field("retained_idempotency_keys", &state.seen.len())
+            .field("max_idempotency_keys", &self.max_idempotency_keys)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for UsageBuffer {
@@ -348,14 +365,16 @@ impl UsageBuffer {
         Ok(batch)
     }
 
-    fn restore(&self, batch: Vec<AggregatedUsage>) -> Result<(), RecordError> {
-        let mut state = self.lock()?;
+    fn restore_after_interruption(&self, batch: Vec<AggregatedUsage>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.retry.is_empty() {
             state.retry = batch;
         } else {
             state.retry.extend(batch);
         }
-        Ok(())
     }
 
     /// Number of live aggregate buckets plus retry events.
@@ -369,11 +388,23 @@ impl UsageBuffer {
 }
 
 /// Coordinates a [`UsageBuffer`] with an off-path exporter.
-#[derive(Debug)]
 pub struct BillingPipeline<E> {
     buffer: UsageBuffer,
     exporter: E,
     flush_in_progress: AtomicBool,
+}
+
+impl<E> fmt::Debug for BillingPipeline<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BillingPipeline")
+            .field("pending_buckets", &self.pending_buckets())
+            .field(
+                "flush_in_progress",
+                &self.flush_in_progress.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<E> BillingPipeline<E> {
@@ -434,14 +465,9 @@ impl<E: BatchExporter> BillingPipeline<E> {
         if batch.is_empty() {
             return Ok(0);
         }
-        let count = batch.len();
-        if let Err(error) = self.exporter.export(&batch).await {
-            self.buffer
-                .restore(batch)
-                .map_err(|restore| ExportError::Provider(restore.to_string()))?;
-            return Err(error);
-        }
-        Ok(count)
+        let retry = RetryGuard::new(&self.buffer, batch);
+        self.exporter.export(retry.batch()).await?;
+        Ok(retry.commit())
     }
 }
 
@@ -453,34 +479,55 @@ impl Drop for FlushGuard<'_> {
     }
 }
 
+/// Owns a prepared batch until the exporter commits successfully.
+///
+/// Dropping a flush future through cancellation or unwinding drops this guard,
+/// which restores the exact batch before another flush can acquire ownership.
+struct RetryGuard<'a> {
+    buffer: &'a UsageBuffer,
+    batch: Option<Vec<AggregatedUsage>>,
+}
+
+impl<'a> RetryGuard<'a> {
+    fn new(buffer: &'a UsageBuffer, batch: Vec<AggregatedUsage>) -> Self {
+        Self {
+            buffer,
+            batch: Some(batch),
+        }
+    }
+
+    fn batch(&self) -> &[AggregatedUsage] {
+        self.batch.as_deref().unwrap_or_default()
+    }
+
+    fn commit(mut self) -> usize {
+        self.batch.take().map_or(0, |batch| batch.len())
+    }
+}
+
+impl Drop for RetryGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            self.buffer.restore_after_interruption(batch);
+        }
+    }
+}
+
 impl<E: BatchExporter> UsageRecorder for BillingPipeline<E> {
     fn record(&self, event: UsageEvent) -> Result<RecordOutcome, RecordError> {
         self.buffer.record(event)
     }
 }
 
-/// Exporter that records batches in memory and emits structured log events.
-#[derive(Debug, Default)]
-pub struct LogExporter {
-    exported: Mutex<Vec<AggregatedUsage>>,
-}
+/// Stateless exporter that emits structured log events.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogExporter;
 
 impl LogExporter {
-    /// Construct an empty logging exporter.
+    /// Construct a logging exporter.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            exported: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Snapshot every aggregate exported so far.
-    #[must_use]
-    pub fn exported(&self) -> Vec<AggregatedUsage> {
-        self.exported
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        Self
     }
 }
 
@@ -496,10 +543,6 @@ impl BatchExporter for LogExporter {
                     "MCP billing usage"
                 );
             }
-            self.exported
-                .lock()
-                .map_err(|_| ExportError::Provider("log exporter lock poisoned".to_owned()))?
-                .extend_from_slice(batch);
             Ok(())
         })
     }
@@ -525,7 +568,7 @@ pub type SharedRecorder = Arc<dyn UsageRecorder>;
 #[cfg(feature = "stripe")]
 mod stripe;
 #[cfg(feature = "stripe")]
-pub use stripe::StripeExporter;
+pub use stripe::{StripeDeadLetter, StripeDeadLetterReason, StripeExporter};
 
 impl fmt::Display for RecordOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -540,7 +583,34 @@ impl fmt::Display for RecordOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
+
+    #[derive(Debug, Default)]
+    struct CaptureExporter {
+        exported: Mutex<Vec<AggregatedUsage>>,
+    }
+
+    impl CaptureExporter {
+        fn exported(&self) -> Vec<AggregatedUsage> {
+            self.exported
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl BatchExporter for CaptureExporter {
+        fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+            Box::pin(async move {
+                self.exported
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(batch);
+                Ok(())
+            })
+        }
+    }
 
     fn event(tenant: &str, units: u64) -> UsageEvent {
         UsageEvent {
@@ -555,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregates_by_customer_and_meter() {
-        let pipeline = BillingPipeline::new(LogExporter::new());
+        let pipeline = BillingPipeline::new(CaptureExporter::default());
         pipeline.record(event("acme", 2)).unwrap();
         pipeline.record(event("acme", 3)).unwrap();
         pipeline.record(event("other", 7)).unwrap();
@@ -569,7 +639,7 @@ mod tests {
 
     #[test]
     fn duplicate_task_completions_are_suppressed_per_tenant() {
-        let pipeline = BillingPipeline::new(LogExporter::new());
+        let pipeline = BillingPipeline::new(CaptureExporter::default());
         let mut first = event("acme", 10);
         first.idempotency_key = Some("task-1".to_owned());
         assert_eq!(
@@ -588,7 +658,7 @@ mod tests {
 
     #[test]
     fn aggregate_overflow_is_reported_without_consuming_the_idempotency_key() {
-        let pipeline = BillingPipeline::new(LogExporter::new());
+        let pipeline = BillingPipeline::new(CaptureExporter::default());
         pipeline.record(event("acme", u64::MAX)).unwrap();
         let mut overflowing = event("acme", 1);
         overflowing.idempotency_key = Some("task-overflow".to_owned());
@@ -634,9 +704,125 @@ mod tests {
         assert_eq!(attempts[0], attempts[1]);
     }
 
+    #[derive(Debug, Default)]
+    struct CancelOnceExporter {
+        attempts: Mutex<Vec<Vec<AggregatedUsage>>>,
+        successful: AtomicUsize,
+    }
+
+    impl BatchExporter for CancelOnceExporter {
+        fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+            Box::pin(async move {
+                let attempt = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    attempts.push(batch.to_vec());
+                    attempts.len()
+                };
+                if attempt == 1 {
+                    std::future::pending::<()>().await;
+                }
+                self.successful.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_restores_the_identical_batch() {
+        let pipeline = Arc::new(BillingPipeline::new(CancelOnceExporter::default()));
+        pipeline.record(event("acme", 9)).unwrap();
+        let flush = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.flush().await }
+        });
+        while pipeline.exporter().attempts.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        flush.abort();
+        assert!(flush.await.unwrap_err().is_cancelled());
+
+        assert_eq!(pipeline.pending_buckets(), 1);
+        assert_eq!(pipeline.flush().await.unwrap(), 1);
+        let attempts = pipeline.exporter().attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], attempts[1]);
+        assert_eq!(pipeline.exporter().successful.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct PanicOnceExporter {
+        attempts: Mutex<Vec<Vec<AggregatedUsage>>>,
+        panicked: AtomicBool,
+        successful: AtomicUsize,
+    }
+
+    impl BatchExporter for PanicOnceExporter {
+        fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+            Box::pin(async move {
+                self.attempts.lock().unwrap().push(batch.to_vec());
+                assert!(
+                    self.panicked.swap(true, Ordering::SeqCst),
+                    "intentional exporter panic"
+                );
+                self.successful.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_flush_restores_the_identical_batch() {
+        let pipeline = Arc::new(BillingPipeline::new(PanicOnceExporter::default()));
+        pipeline.record(event("acme", 11)).unwrap();
+        let flush = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.flush().await }
+        });
+        assert!(flush.await.unwrap_err().is_panic());
+
+        assert_eq!(pipeline.pending_buckets(), 1);
+        assert_eq!(pipeline.flush().await.unwrap(), 1);
+        let attempts = pipeline.exporter().attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], attempts[1]);
+        assert_eq!(pipeline.exporter().successful.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn debug_output_contains_counts_but_not_buffered_identifiers() {
+        #[derive(Debug)]
+        struct SensitiveExporter(&'static str);
+
+        impl BatchExporter for SensitiveExporter {
+            fn export<'a>(&'a self, _batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let pipeline = BillingPipeline::new(SensitiveExporter("https://secret.example"));
+        let mut sensitive = event("tenant-private", 3);
+        sensitive.customer_id = "customer-private".to_owned();
+        sensitive.meter = "meter-private".to_owned();
+        sensitive.idempotency_key = Some("task-private".to_owned());
+        pipeline.record(sensitive).unwrap();
+
+        let debug = format!("{pipeline:?}");
+        for secret in [
+            "tenant-private",
+            "customer-private",
+            "meter-private",
+            "task-private",
+            "https://secret.example",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("pending_buckets"));
+        assert_eq!(pipeline.exporter().0, "https://secret.example");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_recording_reconciles_exactly() {
-        let pipeline = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let pipeline = Arc::new(BillingPipeline::new(CaptureExporter::default()));
         let threads = 8;
         let per_thread = 2_000;
         let mut handles = Vec::new();

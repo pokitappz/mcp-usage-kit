@@ -1,6 +1,6 @@
 # Stripe Billing Meter Events API contract
 
-Verified 2026-07-31 against Stripe's current documentation and the current
+Verified 2026-08-01 against Stripe's current documentation and the current
 `reqwest` release. Re-check this note before changing the exporter.
 
 ## Endpoint and authentication
@@ -32,6 +32,13 @@ days and no more than 5 minutes in the future. Stripe enforces identifier
 uniqueness within a rolling 24-hour window. This exporter pre-aggregates events,
 uses globally unique stable identifiers, and retries the same identifier after
 an ambiguous failure.
+
+An aggregate strictly older than the 35-day window is quarantined without
+changing its timestamp. `StripeExporter` retains up to 1,024 such aggregates by
+default, deduplicated by identifier, and exposes them through
+`take_dead_letters` for reconciliation. Fresh aggregates in a mixed batch still
+export. Retention is configurable with `with_dead_letter_capacity`; evictions
+are observable through `dropped_dead_letters`.
 
 The v1 endpoint supports 1,000 live-mode calls per second. Sandbox calls count
 toward Stripe's basic API limit. Stripe also offers API v2 meter events and a
