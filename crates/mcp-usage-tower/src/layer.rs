@@ -875,9 +875,20 @@ where
     }
 }
 
+/// A JSON-RPC response, if these bytes are one.
+///
+/// Both transports apply the same test, because "terminal" means a JSON-RPC
+/// response and not merely well-formed JSON. A bare `0` is valid JSON and is not
+/// a response to anything.
+fn is_json_rpc_response(value: &Value) -> bool {
+    value.get("result").is_some() || value.get("error").is_some()
+}
+
 pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Value> {
     if has_media_type(content_type, "application/json") {
-        return serde_json::from_slice(bytes).ok();
+        return serde_json::from_slice(bytes)
+            .ok()
+            .filter(is_json_rpc_response);
     }
     if !has_media_type(content_type, "text/event-stream") {
         return None;
@@ -894,7 +905,7 @@ pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Valu
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(&data)
-            && (value.get("result").is_some() || value.get("error").is_some())
+            && is_json_rpc_response(&value)
         {
             terminal = Some(value);
         }
@@ -1904,6 +1915,45 @@ mod tests {
                        data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"}}\n\n";
         let terminal = terminal_response("text/event-stream", stream).unwrap();
         assert_eq!(terminal["id"], 1);
+    }
+
+    #[test]
+    fn well_formed_json_that_is_not_a_response_is_not_terminal() {
+        // Found by the property test in `properties.rs`. `application/json` used
+        // to accept anything that parsed, so a bare scalar counted as a terminal
+        // response while the SSE path required a JSON-RPC shape. Both now apply
+        // the same test. Nothing was billable either way, but the two transports
+        // classified the same body differently.
+        for body in [
+            b"0".as_slice(),
+            b"null".as_slice(),
+            b"\"a string\"".as_slice(),
+            b"[]".as_slice(),
+            b"{}".as_slice(),
+            br#"{"jsonrpc":"2.0","id":1}"#.as_slice(),
+        ] {
+            assert!(
+                terminal_response("application/json", body).is_none(),
+                "{} is not a JSON-RPC response",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        // The shapes that are responses still are.
+        assert!(
+            terminal_response(
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}"#,
+            )
+            .is_some()
+        );
+        assert!(
+            terminal_response(
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32020}}"#,
+            )
+            .is_some()
+        );
     }
 
     #[test]
