@@ -23,6 +23,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `StripeDeadLetterReason`, `with_dead_letter_capacity`, `dead_letter_count`,
   `dropped_dead_letters`, and `take_dead_letters` support explicit
   reconciliation without rewriting timestamps.
+- Stripe reconciliation also quarantines timestamps more than five minutes in
+  the future and individual events synchronously rejected as permanently
+  invalid, without blocking later valid events in the batch.
+- `StripeExporter::quarantine_async_rejection` lets an application retain an
+  original aggregate after it verifies and correlates Stripe's asynchronous
+  Meter Event failure notification.
+- Stripe transient retries retain process-local partial-batch progress, require
+  the identical batch, and skip events whose successful responses were already
+  confirmed.
 
 ### Fixed
 
