@@ -65,6 +65,13 @@ the application that embeds them.
   This keeps plaintext identifiers out of backend key names but does not prevent
   dictionary recovery of low-entropy values. A keyed-hash migration requires a
   coordinated key-format rollout and is not part of the current API.
+- **Repository and release controls.** The required administrative baseline is
+  encoded in `scripts/configure-github-controls.sh`: updates to `main` require a
+  code-owner-approved pull request, resolution of review threads, and every CI
+  job from the GitHub Actions app. Version tags are immutable, and the release
+  environment requires review and accepts only `v*` tags. Independently of
+  repository settings, publishing refuses a tagged commit that is not
+  reachable from the current `origin/main`.
 - **Task-attribution payloads.** The edge resolves named pricing when a durable
   task is created. Stores retain only the unsigned integer price and a fixed
   method category. Tool names, prompt names, resource URIs, and extension method

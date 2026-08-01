@@ -20,4 +20,22 @@ if [[ "$RELEASE_TAG" != "v$versions" ]]; then
   exit 1
 fi
 
-echo "Release tag matches workspace version $versions"
+release_commitish="${RELEASE_COMMIT:-refs/tags/$RELEASE_TAG}"
+release_base_ref="${RELEASE_BASE_REF:-refs/remotes/origin/main}"
+
+if ! release_commit="$(git rev-parse --verify "${release_commitish}^{commit}" 2>/dev/null)"; then
+  echo "Release commit is not available: $release_commitish" >&2
+  exit 1
+fi
+
+if ! git rev-parse --verify "${release_base_ref}^{commit}" >/dev/null 2>&1; then
+  echo "Release base is not available: $release_base_ref" >&2
+  exit 1
+fi
+
+if ! git merge-base --is-ancestor "$release_commit" "$release_base_ref"; then
+  echo "Release commit is not reachable from $release_base_ref" >&2
+  exit 1
+fi
+
+echo "Release tag matches workspace version $versions and commit provenance is valid"

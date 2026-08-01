@@ -57,6 +57,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- A checked-in administrator script configures every CI job as required before
+  `main` can advance, makes release tags immutable, and review-gates the release
+  environment. The publish workflow independently verifies that a version tag
+  points to a commit already on `main`.
 - Redis, Valkey, and PostgreSQL task-attribution values no longer contain raw
   tool names, prompt names, resource URIs, or extension method strings. Their
   versioned binary record contains only a fixed method category and resolved

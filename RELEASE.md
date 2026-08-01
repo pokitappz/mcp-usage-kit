@@ -2,14 +2,27 @@
 
 All five crates share one version and are released together in dependency order.
 
+A repository administrator must apply the checked-in GitHub control baseline
+once, and after any intentional CI job-name change:
+
+```sh
+bash scripts/configure-github-controls.sh
+```
+
+The default release reviewer and code owner is `@pokitappz`. Set
+`RELEASE_REVIEWER` to another GitHub login when appropriate. The script is
+idempotent and requires an authenticated `gh` session with repository
+Administration write permission.
+
 ## Prepare a release
 
 1. Confirm the five package names are still available for the first release.
 2. Update `workspace.package.version` in `Cargo.toml` and regenerate
    `Cargo.lock`.
 3. Move the relevant changelog entries from Unreleased into a dated version.
-4. Run the complete CI command set from `CONTRIBUTING.md`.
-5. Run `cargo package --workspace --locked --no-verify` and inspect each
+4. Merge the release commit to `main` and wait for every required CI check.
+5. Run the complete CI command set from `CONTRIBUTING.md`.
+6. Run `cargo package --workspace --locked --no-verify` and inspect each
    generated archive. Before the first release, verification cannot resolve the
    workspace crates from crates.io. The dependency-ordered `cargo publish`
    commands below perform full package verification once each prerequisite is
@@ -36,13 +49,17 @@ Afterward, configure a trusted publisher for each crate on crates.io with:
 - Workflow: `release.yml`
 - Environment: `release`
 
-Protect the GitHub `release` environment with the review rules appropriate for
-the project.
+The GitHub `release` environment requires an explicit reviewer and accepts only
+tags matching `v*`. Release tags are immutable. The workflow also verifies that
+the tagged commit is reachable from the current `origin/main`; matching the
+workspace version alone is not sufficient.
 
 ## Later releases
 
 Create and publish a GitHub release whose tag exactly matches the workspace
 version, such as `v0.2.0`. The release workflow validates, packages, obtains a
 short-lived crates.io token through OIDC, and publishes the crates in dependency
-order. A release cannot be overwritten or removed from crates.io, so verify the
-tag and generated packages before approving the environment.
+order. The release commit must already be merged to `main`, and the tag cannot
+be moved or deleted after creation. A release cannot be overwritten or removed
+from crates.io, so verify the tag and generated packages before approving the
+environment.
