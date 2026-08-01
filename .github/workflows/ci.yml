@@ -89,6 +89,30 @@ jobs:
       - name: Check licenses, sources, bans, and advisories
         run: cargo +stable deny --all-features check
 
+  fuzz:
+    name: Fuzz targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      # libFuzzer needs nightly, which is why `fuzz/` declares its own workspace
+      # and stays out of every ordinary build. This job exists so the targets
+      # cannot rot: property tests on stable are the actual gate, but a fuzz
+      # target that stopped compiling would otherwise go unnoticed until someone
+      # reached for it.
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Build every target
+        run: cargo +nightly fuzz build --fuzz-dir fuzz
+      - name: Smoke-run each target
+        run: |
+          for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" --fuzz-dir fuzz -- -max_total_time=20
+            echo "::endgroup::"
+          done
+
   backends:
     name: Redis and PostgreSQL integration
     runs-on: ubuntu-latest

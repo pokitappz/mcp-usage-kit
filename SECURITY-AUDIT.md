@@ -249,19 +249,27 @@ Stated plainly, so deployers can make their own call:
   the layer using `cacheScope: "public"` only for results that genuinely do not
   depend on the caller. The default is off precisely because that is an
   assumption about someone else's code.
-- **Rate limiting is the deployer's responsibility.** Nothing in these crates
-  bounds credential-stuffing attempts. See `SECURITY.md`.
-- **API-key entropy is assumed, not enforced.** Keys are compared by SHA-256
-  digest, which is a lookup hash, not a password hash. `InMemoryTenantStore`
-  accepts any string, so a deployment that admits low-entropy keys is offline
-  attackable if the digest table ever leaks.
-- **Parsers are tested but not fuzzed.** The SSE splitter, JSON peeks, and base64
-  sentinel decoder have unit and conformance coverage, and property testing
-  exists in `mcp-usage-core`, but no fuzz targets are defined. This is the most
-  useful remaining addition.
-- **Two crypto backends.** `ring` and `aws-lc-sys` are both compiled from source.
-  Neither has a known advisory; consolidating would reduce the native-code
-  surface.
+- **Per-client rate limiting is still the deployer's responsibility.**
+  `EdgeConfig::with_auth_failure_limit` now bounds sustained guessing across the
+  whole edge, and only failures consume the budget so valid callers are never
+  affected. It is not per-client: the edge has no trustworthy client identity,
+  since a source address belongs to the transport and forwarding headers are
+  attacker controlled. Per-address limits belong in the proxy in front of this.
+  See `SECURITY.md`.
+- **API-key entropy is checked heuristically, not enforced cryptographically.**
+  `InMemoryTenantStore::insert` now refuses obviously weak keys through
+  `validate_api_key_strength`, which measures length, alphabet size, and the
+  Shannon entropy of the observed symbol distribution. It cannot see structure,
+  so a long repeating pattern drawn from a wide alphabet passes, and
+  `insert_unchecked` deliberately bypasses it for fixtures. Generate keys from a
+  CSPRNG rather than relying on this to grade a hand-written one.
+- **Fuzzing is available but not continuous.** Property tests now cover the SSE
+  splitter, the JSON peeks, the base64 sentinel decoder, the protocol-version
+  guard, and the request inspector, and they run on stable in ordinary CI.
+  Coverage-guided targets live in `fuzz/` and require a nightly toolchain, so
+  they are run deliberately rather than on every build. A previous revision of
+  this document claimed property testing already existed in `mcp-usage-core`;
+  that was wrong. `proptest` was a declared dev-dependency that nothing used.
 
 ---
 

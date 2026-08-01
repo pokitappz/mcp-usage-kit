@@ -13,14 +13,21 @@
 mod auth;
 mod cache;
 mod classify;
+mod deferred;
 mod layer;
 mod metrics;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry_metrics;
+#[cfg(test)]
+mod properties;
 mod task;
 
-pub use auth::{InMemoryTenantStore, Tenant, TenantStore, hash_api_key};
+pub use auth::{
+    InMemoryTenantStore, MIN_API_KEY_BYTES, Tenant, TenantStore, WeakApiKey, hash_api_key,
+    validate_api_key_strength,
+};
 pub use classify::{ClassificationError, ProtocolHeaders, classify_protocol_headers};
+pub use deferred::DeferredCompletions;
 pub use layer::{EdgeConfig, MeterBody, MeterLayer, MeterService};
 pub use metrics::{EdgeMetrics, MetricsSnapshot};
 #[cfg(feature = "opentelemetry")]

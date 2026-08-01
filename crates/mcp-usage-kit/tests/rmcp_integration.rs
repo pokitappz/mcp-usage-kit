@@ -58,7 +58,7 @@ impl ServerHandler for Calculator {
 #[tokio::test]
 async fn real_rmcp_tool_call_records_the_configured_units() {
     let tenants = Arc::new(InMemoryTenantStore::new());
-    tenants.insert(
+    tenants.insert_unchecked(
         "test-key",
         Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("sum", 7)),
     );

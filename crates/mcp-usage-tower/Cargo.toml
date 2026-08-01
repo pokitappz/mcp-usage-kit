@@ -34,6 +34,7 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tokio = { workspace = true }
 
 [[bench]]

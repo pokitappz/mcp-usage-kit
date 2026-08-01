@@ -1,2 +1,5 @@
 /target/
 *.profraw
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

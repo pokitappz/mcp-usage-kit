@@ -21,7 +21,7 @@ async fn endpoint() -> Response<Body> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tenants = Arc::new(InMemoryTenantStore::new());
-    tenants.insert("development-key", Tenant::new("local", "customer-local"));
+    tenants.insert_unchecked("development-key", Tenant::new("local", "customer-local"));
     let app = Router::new()
         .route("/mcp", post(endpoint))
         .layer(MeterLayer::new(EdgeConfig::new(tenants)));

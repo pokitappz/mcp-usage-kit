@@ -1,0 +1,39 @@
+[package]
+name = "mcp-usage-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Deliberately outside the main workspace. libFuzzer requires a nightly
+# toolchain, and the workspace is built and tested on stable against a 1.88
+# minimum, so pulling this in would force nightly on every ordinary build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mcp-usage-core = { path = "../crates/mcp-usage-core" }
+serde_json = "1"
+
+[[bin]]
+name = "name_sentinel"
+path = "fuzz_targets/name_sentinel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_version"
+path = "fuzz_targets/protocol_version.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_peek"
+path = "fuzz_targets/body_peek.rs"
+test = false
+doc = false
+bench = false
