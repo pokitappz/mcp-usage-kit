@@ -1,13 +1,19 @@
 //! Distributed durable-task attribution for `UsageKit` for MCP.
 //!
 //! Backends store SHA-256 digests of tenant and task identifiers, never their
-//! plaintext values. Inserts are first-writer-wins and claims are atomic, so a
-//! completed task can be accounted for by at most one application instance.
+//! plaintext values. Values contain only a fixed method category and the price
+//! resolved when the task was created, never a name, URI, or extension method
+//! string. Inserts are first-writer-wins and claims are atomic, so a completed
+//! task can be accounted for by at most one application instance.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+#[cfg(any(feature = "postgres", feature = "redis", test))]
+use mcp_usage_core::{TaskAttribution, TaskOriginKind};
+#[cfg(any(feature = "postgres", feature = "redis", test))]
+use mcp_usage_tower::TaskStoreError;
 #[cfg(any(feature = "postgres", feature = "redis", test))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -45,6 +51,40 @@ pub enum StoreConfigError {
 #[cfg(any(feature = "postgres", feature = "redis", test))]
 fn identifier_hash(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
+}
+
+#[cfg(any(feature = "postgres", feature = "redis", test))]
+fn encode_attribution(attribution: TaskAttribution) -> [u8; 10] {
+    let mut encoded = [0_u8; 10];
+    encoded[0] = 1;
+    encoded[1] = match attribution.origin_kind() {
+        TaskOriginKind::ToolsCall => 1,
+        TaskOriginKind::ResourcesRead => 2,
+        TaskOriginKind::PromptsGet => 3,
+        TaskOriginKind::Other => 255,
+    };
+    encoded[2..].copy_from_slice(&attribution.units().to_be_bytes());
+    encoded
+}
+
+#[cfg(any(feature = "postgres", feature = "redis", test))]
+fn decode_attribution(payload: &[u8]) -> Result<TaskAttribution, TaskStoreError> {
+    let [1, kind, units @ ..] = payload else {
+        return Err(TaskStoreError::InvalidRecord);
+    };
+    let origin_kind = match kind {
+        1 => TaskOriginKind::ToolsCall,
+        2 => TaskOriginKind::ResourcesRead,
+        3 => TaskOriginKind::PromptsGet,
+        255 => TaskOriginKind::Other,
+        _ => return Err(TaskStoreError::InvalidRecord),
+    };
+    let units = u64::from_be_bytes(
+        units
+            .try_into()
+            .map_err(|_| TaskStoreError::InvalidRecord)?,
+    );
+    Ok(TaskAttribution::new(origin_kind, units))
 }
 
 #[cfg(any(feature = "redis", test))]
@@ -85,5 +125,28 @@ mod tests {
         assert!(!valid_prefix(""));
         assert!(!valid_prefix("spaces are rejected"));
         assert!(!valid_prefix(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn attribution_encoding_is_fixed_length_and_validated() {
+        for kind in [
+            TaskOriginKind::ToolsCall,
+            TaskOriginKind::ResourcesRead,
+            TaskOriginKind::PromptsGet,
+            TaskOriginKind::Other,
+        ] {
+            let attribution = TaskAttribution::new(kind, u64::MAX);
+            let encoded = encode_attribution(attribution);
+            assert_eq!(encoded.len(), 10);
+            assert_eq!(decode_attribution(&encoded).unwrap(), attribution);
+        }
+        assert_eq!(
+            decode_attribution(&[1, 2]),
+            Err(TaskStoreError::InvalidRecord)
+        );
+        assert_eq!(
+            decode_attribution(&[2, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Err(TaskStoreError::InvalidRecord)
+        );
     }
 }

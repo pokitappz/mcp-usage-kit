@@ -1182,7 +1182,6 @@ dependencies = [
  "mcp-usage-core",
  "mcp-usage-tower",
  "redis",
- "serde_json",
  "sha2",
  "sqlx",
  "thiserror",

@@ -25,8 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use mcp_usage_core::{Call, Method};
+use mcp_usage_core::{TaskAttribution, TaskOriginKind};
 use mcp_usage_tower::TaskAttributionStore;
+use sha2::{Digest, Sha256};
 
 /// Resolve a backend URL, or decide whether absence is a skip or a failure.
 fn backend_url(variable: &str) -> Option<String> {
@@ -56,8 +57,23 @@ fn unique(label: &str) -> String {
     )
 }
 
-fn origin_call() -> Call {
-    Call::new(Method::ToolsCall, Some("expensive".to_owned()))
+fn identifier_hash(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+fn identifier_hash_hex(value: &str) -> String {
+    use std::fmt::Write;
+
+    identifier_hash(value)
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+            encoded
+        })
+}
+
+const fn origin_attribution() -> TaskAttribution {
+    TaskAttribution::new(TaskOriginKind::ToolsCall, 250)
 }
 
 /// Every invariant the edge relies on when pricing a durable task.
@@ -65,7 +81,7 @@ async fn assert_task_store_contract(store: &dyn TaskAttributionStore) {
     let tenant = unique("tenant");
     let neighbour = unique("tenant");
     let task = unique("task");
-    let origin = origin_call();
+    let origin = origin_attribution();
 
     assert_eq!(
         store.get(&tenant, &task).await.unwrap(),
@@ -73,11 +89,8 @@ async fn assert_task_store_contract(store: &dyn TaskAttributionStore) {
         "an unknown task must not resolve"
     );
 
-    store.insert(&tenant, &task, origin.clone()).await.unwrap();
-    assert_eq!(
-        store.get(&tenant, &task).await.unwrap(),
-        Some(origin.clone())
-    );
+    store.insert(&tenant, &task, origin).await.unwrap();
+    assert_eq!(store.get(&tenant, &task).await.unwrap(), Some(origin));
 
     // A durable task's origin is immutable. A reused or hostile task ID must not
     // replace the price attribution captured the first time, or a caller could
@@ -86,32 +99,33 @@ async fn assert_task_store_contract(store: &dyn TaskAttributionStore) {
         .insert(
             &tenant,
             &task,
-            Call::new(Method::ToolsCall, Some("cheap".to_owned())),
+            TaskAttribution::new(TaskOriginKind::ToolsCall, 1),
         )
         .await
         .unwrap();
     assert_eq!(
         store.get(&tenant, &task).await.unwrap(),
-        Some(origin.clone()),
+        Some(origin),
         "the first writer must win"
     );
 
     // The same task ID belonging to another tenant is a different record.
     store
-        .insert(&neighbour, &task, Call::new(Method::PromptsGet, None))
+        .insert(
+            &neighbour,
+            &task,
+            TaskAttribution::new(TaskOriginKind::PromptsGet, 5),
+        )
         .await
         .unwrap();
     assert_eq!(
         store.get(&tenant, &task).await.unwrap(),
-        Some(origin.clone()),
+        Some(origin),
         "another tenant's write must not disturb this one"
     );
 
     // Claiming consumes the record exactly once.
-    assert_eq!(
-        store.claim(&tenant, &task).await.unwrap(),
-        Some(origin.clone())
-    );
+    assert_eq!(store.claim(&tenant, &task).await.unwrap(), Some(origin));
     assert_eq!(
         store.claim(&tenant, &task).await.unwrap(),
         None,
@@ -122,33 +136,26 @@ async fn assert_task_store_contract(store: &dyn TaskAttributionStore) {
     // The neighbour's record survives its neighbour being claimed.
     assert_eq!(
         store.claim(&neighbour, &task).await.unwrap(),
-        Some(Call::new(Method::PromptsGet, None))
+        Some(TaskAttribution::new(TaskOriginKind::PromptsGet, 5))
     );
 
-    // Extension methods and absent names survive the round trip, since both
-    // reach the price book verbatim.
-    for call in [
-        Call::new(
-            Method::Other("io.example/frobnicate".to_owned()),
-            Some("job".to_owned()),
-        ),
-        Call::new(Method::ToolsCall, None),
+    // Every fixed category and the full unsigned price range survive storage.
+    for attribution in [
+        TaskAttribution::new(TaskOriginKind::Other, u64::MAX),
+        TaskAttribution::new(TaskOriginKind::ResourcesRead, 0),
     ] {
         let id = unique("task");
-        store.insert(&tenant, &id, call.clone()).await.unwrap();
+        store.insert(&tenant, &id, attribution).await.unwrap();
         assert_eq!(
             store.claim(&tenant, &id).await.unwrap(),
-            Some(call.clone()),
-            "round trip failed for {call:?}"
+            Some(attribution),
+            "round trip failed for {attribution:?}"
         );
     }
 
     // Removal is silent about keys that were never there.
     let removable = unique("task");
-    store
-        .insert(&tenant, &removable, origin.clone())
-        .await
-        .unwrap();
+    store.insert(&tenant, &removable, origin).await.unwrap();
     store.remove(&tenant, &removable).await.unwrap();
     assert_eq!(store.get(&tenant, &removable).await.unwrap(), None);
     store.remove(&tenant, &unique("task")).await.unwrap();
@@ -161,8 +168,8 @@ async fn assert_task_store_contract(store: &dyn TaskAttributionStore) {
 async fn assert_claim_is_exclusive_under_contention(store: Arc<dyn TaskAttributionStore>) {
     let tenant = unique("tenant");
     let task = unique("task");
-    let origin = origin_call();
-    store.insert(&tenant, &task, origin.clone()).await.unwrap();
+    let origin = origin_attribution();
+    store.insert(&tenant, &task, origin).await.unwrap();
 
     let winners = Arc::new(AtomicU64::new(0));
     let mut racers = Vec::new();
@@ -171,11 +178,14 @@ async fn assert_claim_is_exclusive_under_contention(store: Arc<dyn TaskAttributi
         let winners = Arc::clone(&winners);
         let tenant = tenant.clone();
         let task = task.clone();
-        let expected = origin.clone();
+        let expected = origin;
         racers.push(tokio::spawn(async move {
             let claimed = store.claim(&tenant, &task).await.expect("claim");
-            if let Some(call) = claimed {
-                assert_eq!(call, expected, "a winning claim returned the wrong origin");
+            if let Some(attribution) = claimed {
+                assert_eq!(
+                    attribution, expected,
+                    "a winning claim returned the wrong origin"
+                );
                 winners.fetch_add(1, Ordering::Relaxed);
             }
         }));
@@ -195,7 +205,10 @@ async fn assert_claim_is_exclusive_under_contention(store: Arc<dyn TaskAttributi
 async fn assert_records_expire(store: &dyn TaskAttributionStore) {
     let tenant = unique("tenant");
     let task = unique("task");
-    store.insert(&tenant, &task, origin_call()).await.unwrap();
+    store
+        .insert(&tenant, &task, origin_attribution())
+        .await
+        .unwrap();
     assert!(store.get(&tenant, &task).await.unwrap().is_some());
 
     tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -216,9 +229,11 @@ async fn assert_records_expire(store: &dyn TaskAttributionStore) {
 mod redis_backend {
     use super::{
         Arc, Duration, assert_claim_is_exclusive_under_contention, assert_records_expire,
-        assert_task_store_contract, backend_url,
+        assert_task_store_contract, backend_url, identifier_hash_hex, unique,
     };
+    use mcp_usage_core::{Call, Method, PriceBook, TaskAttribution};
     use mcp_usage_store::RedisTaskStore;
+    use mcp_usage_tower::TaskAttributionStore;
 
     async fn connect(ttl: Duration) -> Option<RedisTaskStore> {
         let url = backend_url("MCP_USAGE_TEST_REDIS_URL")?;
@@ -254,6 +269,48 @@ mod redis_backend {
     }
 
     #[tokio::test]
+    async fn raw_record_contains_no_resource_uri_or_plaintext_identifier() {
+        let Some(url) = backend_url("MCP_USAGE_TEST_REDIS_URL") else {
+            return;
+        };
+        let store = RedisTaskStore::connect(&url, "mcp-usage-test", Duration::from_secs(60))
+            .await
+            .expect("connect to Redis");
+        let tenant = unique("private-tenant@example.test");
+        let task = unique("private-task");
+        let private_uri = "file:///customers/private@example.test/record";
+        let call = Call::new(Method::ResourcesRead, Some(private_uri.to_owned()));
+        let attribution =
+            TaskAttribution::from_call(&call, &PriceBook::flat(1).with_name(private_uri, 77));
+        store.insert(&tenant, &task, attribution).await.unwrap();
+
+        let key = format!(
+            "mcp-usage-test:{}:{}",
+            identifier_hash_hex(&tenant),
+            identifier_hash_hex(&task)
+        );
+        let client = redis::Client::open(url).expect("valid Redis URL");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect for raw inspection");
+        let payload: Vec<u8> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("read raw attribution");
+
+        assert_eq!(payload.len(), 10);
+        assert!(!key.contains(&tenant));
+        assert!(!key.contains(&task));
+        assert!(
+            !payload
+                .windows(private_uri.len())
+                .any(|part| part == private_uri.as_bytes())
+        );
+    }
+
+    #[tokio::test]
     async fn a_rejected_connection_url_is_reported_without_leaking_it() {
         // A malformed URL fails in `Client::open`, which keeps this instant.
         // Pointing at a closed port would exercise the same `map_err` arm but
@@ -279,8 +336,9 @@ mod redis_backend {
 mod postgres_backend {
     use super::{
         Arc, Duration, assert_claim_is_exclusive_under_contention, assert_records_expire,
-        assert_task_store_contract, backend_url, origin_call, unique,
+        assert_task_store_contract, backend_url, identifier_hash, origin_attribution, unique,
     };
+    use mcp_usage_core::{Call, Method, PriceBook, TaskAttribution};
     use mcp_usage_store::PostgresTaskStore;
     use mcp_usage_tower::TaskAttributionStore;
 
@@ -319,6 +377,58 @@ mod postgres_backend {
             return;
         };
         assert_records_expire(&store).await;
+    }
+
+    #[tokio::test]
+    async fn raw_record_contains_no_resource_uri_or_name_columns() {
+        let Some(url) = backend_url("MCP_USAGE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to PostgreSQL");
+        let store =
+            PostgresTaskStore::new(pool.clone(), Duration::from_secs(60)).expect("valid ttl");
+        store.install().await.expect("install schema");
+        let tenant = unique("private-tenant@example.test");
+        let task = unique("private-task");
+        let private_uri = "file:///customers/private@example.test/record";
+        let call = Call::new(Method::ResourcesRead, Some(private_uri.to_owned()));
+        let attribution =
+            TaskAttribution::from_call(&call, &PriceBook::flat(1).with_name(private_uri, 77));
+        store.insert(&tenant, &task, attribution).await.unwrap();
+
+        let (payload,): (Vec<u8>,) = sqlx::query_as(
+            "SELECT attribution FROM mcp_usage_task_attribution \
+             WHERE tenant_hash = $1 AND task_hash = $2",
+        )
+        .bind(identifier_hash(&tenant).to_vec())
+        .bind(identifier_hash(&task).to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("read raw attribution");
+        let columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+             AND table_name = 'mcp_usage_task_attribution'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("inspect attribution schema");
+
+        assert_eq!(payload.len(), 10);
+        assert!(
+            !payload
+                .windows(private_uri.len())
+                .any(|part| part == private_uri.as_bytes())
+        );
+        assert!(
+            !columns
+                .iter()
+                .any(|(column,)| column == "method" || column == "name")
+        );
     }
 
     #[tokio::test]
@@ -431,8 +541,11 @@ mod postgres_backend {
         let tenant = unique("tenant");
         let doomed = unique("task");
         let surviving = unique("task");
-        short.insert(&tenant, &doomed, origin_call()).await.unwrap();
-        long.insert(&tenant, &surviving, origin_call())
+        short
+            .insert(&tenant, &doomed, origin_attribution())
+            .await
+            .unwrap();
+        long.insert(&tenant, &surviving, origin_attribution())
             .await
             .unwrap();
 
@@ -442,7 +555,7 @@ mod postgres_backend {
         assert!(pruned >= 1, "the expired row should have been reclaimed");
         assert_eq!(
             long.get(&tenant, &surviving).await.unwrap(),
-            Some(origin_call()),
+            Some(origin_attribution()),
             "pruning must not touch live rows"
         );
     }

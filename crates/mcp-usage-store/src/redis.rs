@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use mcp_usage_core::{Call, Method};
+use mcp_usage_core::TaskAttribution;
 use mcp_usage_tower::{TaskAttributionStore, TaskStoreError, TaskStoreFuture};
 
-use crate::{StoreConfigError, encode_hash, valid_prefix};
+use crate::{StoreConfigError, decode_attribution, encode_attribution, encode_hash, valid_prefix};
 
 const CLAIM_SCRIPT: &str = "local value=redis.call('GET',KEYS[1]);if value then redis.call('DEL',KEYS[1]);end;return value";
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -95,15 +95,13 @@ impl TaskAttributionStore for RedisTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-        call: Call,
+        attribution: TaskAttribution,
     ) -> TaskStoreFuture<'a, ()> {
         Box::pin(async move {
-            let payload = serde_json::to_string(&(call.method.as_str(), call.name))
-                .map_err(|_| TaskStoreError::InvalidRecord)?;
             let mut connection = self.connection.clone();
             let _: Option<String> = redis::cmd("SET")
                 .arg(self.key(tenant_id, task_id))
-                .arg(payload)
+                .arg(&encode_attribution(attribution))
                 .arg("NX")
                 .arg("EX")
                 .arg(self.ttl_seconds)
@@ -118,15 +116,15 @@ impl TaskAttributionStore for RedisTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
             let mut connection = self.connection.clone();
-            let payload: Option<String> = redis::cmd("GET")
+            let payload: Option<Vec<u8>> = redis::cmd("GET")
                 .arg(self.key(tenant_id, task_id))
                 .query_async(&mut connection)
                 .await
                 .map_err(|_| TaskStoreError::BackendUnavailable)?;
-            payload.map(|value| decode_call(&value)).transpose()
+            payload.as_deref().map(decode_attribution).transpose()
         })
     }
 
@@ -134,17 +132,17 @@ impl TaskAttributionStore for RedisTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
             let mut connection = self.connection.clone();
-            let payload: Option<String> = redis::cmd("EVAL")
+            let payload: Option<Vec<u8>> = redis::cmd("EVAL")
                 .arg(CLAIM_SCRIPT)
                 .arg(1)
                 .arg(self.key(tenant_id, task_id))
                 .query_async(&mut connection)
                 .await
                 .map_err(|_| TaskStoreError::BackendUnavailable)?;
-            payload.map(|value| decode_call(&value)).transpose()
+            payload.as_deref().map(decode_attribution).transpose()
         })
     }
 
@@ -161,24 +159,17 @@ impl TaskAttributionStore for RedisTaskStore {
     }
 }
 
-fn decode_call(payload: &str) -> Result<Call, TaskStoreError> {
-    let (method, name): (String, Option<String>) =
-        serde_json::from_str(payload).map_err(|_| TaskStoreError::InvalidRecord)?;
-    Ok(Call::new(Method::parse(&method), name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_usage_core::TaskOriginKind;
 
     #[test]
-    fn payload_round_trip_preserves_extension_methods() {
-        let call = Call::new(
-            Method::Other("vendor/run".to_owned()),
-            Some("job".to_owned()),
-        );
-        let payload = serde_json::to_string(&(call.method.as_str(), call.name.clone())).unwrap();
-        assert_eq!(decode_call(&payload).unwrap(), call);
+    fn payload_contains_only_fixed_category_and_resolved_units() {
+        let attribution = TaskAttribution::new(TaskOriginKind::Other, 42);
+        let payload = encode_attribution(attribution);
+        assert_eq!(payload.len(), 10);
+        assert_eq!(decode_attribution(&payload).unwrap(), attribution);
     }
 
     #[tokio::test]

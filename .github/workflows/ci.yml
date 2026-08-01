@@ -40,6 +40,16 @@ jobs:
         run: cargo +stable doc --workspace --all-features --no-deps --locked
       - name: Build publishable archives
         run: cargo +stable package --workspace --locked --no-verify
+      - name: Test release metadata guards
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          RELEASE_TAG="v$version" RELEASE_COMMIT=HEAD RELEASE_BASE_REF=HEAD \
+            bash scripts/check-release-version.sh
+          if RELEASE_TAG=v0.0.0 RELEASE_COMMIT=HEAD RELEASE_BASE_REF=HEAD \
+            bash scripts/check-release-version.sh; then
+            echo "A mismatched release version was accepted" >&2
+            exit 1
+          fi
 
   msrv:
     name: Rust 1.88 minimum version

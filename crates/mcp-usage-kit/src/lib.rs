@@ -30,7 +30,8 @@ pub use mcp_usage_tower as tower;
 
 pub use mcp_usage_core::{
     Billable, Call, Charge, FreeReason, LimitDecision, LimitReason, Limits, Method, PriceBook,
-    Usage, assess_limits, decide, decide_with_task_origin,
+    TaskAttribution, TaskOriginKind, Usage, assess_limits, decide, decide_with_task_attribution,
+    decide_with_task_origin,
 };
 pub use mcp_usage_export::{
     AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, FnExporter, LogExporter,
