@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
-use http::header::{AUTHORIZATION, CONTENT_TYPE};
+use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::{Body, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -31,6 +31,9 @@ pub type BoxError = Box<dyn StdError + Send + Sync>;
 /// Response body returned by [`MeterService`].
 pub type MeterBody = UnsyncBoxBody<Bytes, BoxError>;
 
+const DEFAULT_CACHE_ENTRIES: usize = 512;
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Runtime configuration shared by every cloned metering service.
 #[derive(Clone)]
 pub struct EdgeConfig {
@@ -42,6 +45,10 @@ pub struct EdgeConfig {
     meter_name: String,
     max_request_body: usize,
     max_response_capture: usize,
+    cache_max_entries: usize,
+    cache_max_ttl: Duration,
+    share_public_cache: bool,
+    forward_credentials: bool,
 }
 
 impl std::fmt::Debug for EdgeConfig {
@@ -50,6 +57,8 @@ impl std::fmt::Debug for EdgeConfig {
             .field("meter_name", &self.meter_name)
             .field("max_request_body", &self.max_request_body)
             .field("max_response_capture", &self.max_response_capture)
+            .field("share_public_cache", &self.share_public_cache)
+            .field("forward_credentials", &self.forward_credentials)
             .finish_non_exhaustive()
     }
 }
@@ -62,12 +71,34 @@ impl EdgeConfig {
             tenants,
             recorder: Arc::new(NoopRecorder),
             tasks: Arc::new(InMemoryTaskStore::new()),
-            cache: Arc::new(ResponseCache::new(512, Duration::from_secs(24 * 60 * 60))),
+            cache: Arc::new(ResponseCache::new(
+                DEFAULT_CACHE_ENTRIES,
+                DEFAULT_CACHE_TTL,
+                false,
+            )),
             metrics: Arc::new(EdgeMetrics::default()),
             meter_name: "mcp_units".to_owned(),
             max_request_body: 1024 * 1024,
             max_response_capture: 1024 * 1024,
+            cache_max_entries: DEFAULT_CACHE_ENTRIES,
+            cache_max_ttl: DEFAULT_CACHE_TTL,
+            share_public_cache: false,
+            forward_credentials: false,
         }
+    }
+
+    /// Rebuild the cache from every input that shapes it.
+    ///
+    /// The builders below are order-independent because each one records its
+    /// setting and then rebuilds from all of them. Constructing the cache in
+    /// place inside a single builder would let a later call silently discard an
+    /// earlier one.
+    fn rebuild_cache(&mut self) {
+        self.cache = Arc::new(ResponseCache::new(
+            self.cache_max_entries,
+            self.cache_max_ttl,
+            self.share_public_cache,
+        ));
     }
 
     /// Install the hot-path usage recorder.
@@ -94,7 +125,42 @@ impl EdgeConfig {
     /// Configure cache capacity and the maximum honored server TTL.
     #[must_use]
     pub fn with_cache(mut self, max_entries: usize, max_ttl: Duration) -> Self {
-        self.cache = Arc::new(ResponseCache::new(max_entries, max_ttl));
+        self.cache_max_entries = max_entries;
+        self.cache_max_ttl = max_ttl;
+        self.rebuild_cache();
+        self
+    }
+
+    /// Share results the origin marks `cacheScope: "public"` across tenants.
+    ///
+    /// Disabled by default. A `"public"` result is an assertion by the origin
+    /// that the body does not depend on who asked for it; honoring it puts one
+    /// entry in a bucket every authorization context reads, so an origin that
+    /// mislabels a tenant-specific result turns that mistake into a cross-tenant
+    /// disclosure at the edge. Cacheable methods include `resources/read`, so
+    /// the blast radius is resource contents, not just discovery listings.
+    ///
+    /// Enable this only when the origin's public results are genuinely
+    /// tenant-independent. Leaving it off costs cache hit rate and nothing else:
+    /// a cache may always decline to reuse a response.
+    #[must_use]
+    pub fn with_public_cache_sharing(mut self, share: bool) -> Self {
+        self.share_public_cache = share;
+        self.rebuild_cache();
+        self
+    }
+
+    /// Forward the API key to the inner service after authenticating it.
+    ///
+    /// Disabled by default: the edge consumes the credential, so passing it on
+    /// hands the inner service a secret it was not issued. That is harmless when
+    /// the origin runs in-process, and an exposure the moment this layer fronts
+    /// an origin in another trust domain.
+    ///
+    /// Enable it when the origin performs its own check against the same key.
+    #[must_use]
+    pub fn with_credential_forwarding(mut self, forward: bool) -> Self {
+        self.forward_credentials = forward;
         self
     }
 
@@ -181,7 +247,7 @@ where
         let config = self.config.clone();
 
         Box::pin(async move {
-            let (parts, request_body) = request.into_parts();
+            let (mut parts, request_body) = request.into_parts();
             let protocol = match classify_request_headers(&parts.headers) {
                 Ok(protocol) => protocol,
                 Err(message) => {
@@ -196,7 +262,7 @@ where
             let api_key = match extract_api_key(&parts.headers) {
                 Ok(api_key) => api_key,
                 Err(error) => {
-                    config.metrics.rejected();
+                    config.metrics.unauthenticated();
                     let message = match error {
                         CredentialError::Missing => "missing API key",
                         CredentialError::Invalid => "invalid or ambiguous API key headers",
@@ -209,7 +275,7 @@ where
                 }
             };
             let Some(tenant) = config.tenants.authenticate(api_key) else {
-                config.metrics.rejected();
+                config.metrics.unauthenticated();
                 return Ok(error_response(
                     StatusCode::UNAUTHORIZED,
                     "UNAUTHENTICATED",
@@ -272,6 +338,13 @@ where
                 config.metrics.cache_miss();
             }
 
+            // The credential was consumed by the gate above. Removing both
+            // headers unconditionally is safe: `extract_api_key` rejects a
+            // request carrying both, so at most one of them is present.
+            if !config.forward_credentials {
+                parts.headers.remove(crate::API_KEY_HEADER);
+                parts.headers.remove(AUTHORIZATION);
+            }
             let request = Request::from_parts(parts, Full::new(request_bytes));
             let response = inner.call(request).await?;
             let (parts, body) = response.into_parts();
@@ -374,15 +447,24 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Met
             .boxed_unsync(),
     );
     *response.status_mut() = status;
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
+    // The message can echo a rejected header value back to the caller, so pin
+    // the interpretation to JSON rather than leaving it to content sniffing.
+    headers.insert(
+        X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
     response
 }
 
 fn cached_response(cached: CachedResponse, completion: Completion) -> Response<MeterBody> {
     let body = Bytes::from(cached.body.to_string());
+    let shares_public = completion.config.share_public_cache;
     let observed = ObservedBody::new(Full::new(body), completion);
     let mut response = Response::new(
         observed
@@ -392,9 +474,17 @@ fn cached_response(cached: CachedResponse, completion: Completion) -> Response<M
     *response.status_mut() = cached.status;
     *response.version_mut() = cached.version;
     *response.headers_mut() = cached.headers;
-    response
-        .headers_mut()
-        .insert("x-mcp-usage-cache", http::HeaderValue::from_static("hit"));
+    let headers = response.headers_mut();
+    headers.insert("x-mcp-usage-cache", http::HeaderValue::from_static("hit"));
+    headers.insert(
+        X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    if !shares_public {
+        // Nothing here is safe for a shared cache to reuse across callers, and a
+        // CDN in front of the edge has no idea the body is keyed on an API key.
+        headers.insert(CACHE_CONTROL, http::HeaderValue::from_static("private"));
+    }
     response
 }
 
@@ -1049,6 +1139,204 @@ mod tests {
         )
         .await;
         assert_eq!(billing.flush().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_results_cross_tenants_only_when_sharing_is_enabled() {
+        // Same scenario as the private-scope test above, but with the origin
+        // declaring `cacheScope: "public"`. The origin call count is the
+        // observable: two calls means tenant B was served from the origin, one
+        // means it was served tenant A's cached body.
+        for (share, expected_origin_calls) in [(false, 2), (true, 1)] {
+            let tenants = Arc::new(InMemoryTenantStore::new());
+            tenants.insert("key-a", Tenant::new("a", "cus_a"));
+            tenants.insert("key-b", Tenant::new("b", "cus_b"));
+            let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let inner_calls = calls.clone();
+            let service = ServiceBuilder::new()
+                .layer(MeterLayer::new(
+                    EdgeConfig::new(tenants).with_public_cache_sharing(share),
+                ))
+                .service(service_fn(move |_request: Request<Full<Bytes>>| {
+                    inner_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async {
+                        Ok::<_, Infallible>(response(&json!({
+                            "jsonrpc":"2.0","id":1,
+                            "result":{
+                                "resultType":"complete","tools":[],
+                                "ttlMs":60000,"cacheScope":"public"
+                            }
+                        })))
+                    }
+                }));
+
+            for key in ["key-a", "key-b"] {
+                consume(
+                    service
+                        .clone()
+                        .oneshot(request(
+                            "tools/list",
+                            None,
+                            &json!({"jsonrpc":"2.0","id":1,"params":{}}),
+                            key,
+                        ))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+            }
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                expected_origin_calls,
+                "with_public_cache_sharing({share})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_consumed_credential_does_not_reach_the_inner_service() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+
+        for (forward, expected) in [(false, false), (true, true)] {
+            for bearer in [false, true] {
+                let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let inner_seen = seen.clone();
+                let service = ServiceBuilder::new()
+                    .layer(MeterLayer::new(
+                        EdgeConfig::new(tenants.clone()).with_credential_forwarding(forward),
+                    ))
+                    .service(service_fn(move |request: Request<Full<Bytes>>| {
+                        let headers = request.headers();
+                        inner_seen.store(
+                            headers.contains_key(crate::API_KEY_HEADER)
+                                || headers.contains_key(AUTHORIZATION),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        async {
+                            Ok::<_, Infallible>(response(&json!({
+                                "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                            })))
+                        }
+                    }));
+
+                let mut call = request(
+                    "tools/call",
+                    Some("tool"),
+                    &json!({"id":1,"params":{"name":"tool"}}),
+                    "secret",
+                );
+                if bearer {
+                    // Exactly one credential header may be present.
+                    call.headers_mut().remove(crate::API_KEY_HEADER);
+                    call.headers_mut().insert(
+                        AUTHORIZATION,
+                        http::HeaderValue::from_static("Bearer secret"),
+                    );
+                }
+                consume(service.oneshot(call).await.unwrap()).await;
+
+                assert_eq!(
+                    seen.load(std::sync::atomic::Ordering::Relaxed),
+                    expected,
+                    "forwarding={forward} bearer={bearer}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_responses_pin_their_content_type_and_stay_out_of_shared_caches() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert("key-a", Tenant::new("a", "cus_a"));
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(EdgeConfig::new(tenants)))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,
+                    "result":{"resultType":"complete","tools":[],"ttlMs":60000,"cacheScope":"private"}
+                })))
+            }));
+
+        // The rejection path echoes the offending header value back to the caller.
+        let mut malformed = request("tools/list", None, &json!({"id":1,"params":{}}), "key-a");
+        malformed.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            http::HeaderValue::from_static("<not-a-date>"),
+        );
+        let rejected = service.clone().oneshot(malformed).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rejected.headers()[X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(rejected.headers()[CACHE_CONTROL], "no-store");
+
+        consume(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/list",
+                    None,
+                    &json!({"id":1,"params":{}}),
+                    "key-a",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let hit = service
+            .oneshot(request(
+                "tools/list",
+                None,
+                &json!({"id":2,"params":{}}),
+                "key-a",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hit.headers()["x-mcp-usage-cache"], "hit");
+        assert_eq!(hit.headers()[X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(hit.headers()[CACHE_CONTROL], "private");
+        consume(hit).await;
+    }
+
+    #[tokio::test]
+    async fn credential_failures_are_counted_apart_from_header_failures() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        let config = EdgeConfig::new(tenants);
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({"result": {}})))
+            }));
+
+        let unknown_key = service
+            .clone()
+            .oneshot(request(
+                "tools/list",
+                None,
+                &json!({"id":1,"params":{}}),
+                "wrong",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown_key.status(), StatusCode::UNAUTHORIZED);
+
+        // Classification runs before authentication, so this never reaches the
+        // credential gate and must land on the other counter.
+        let mut legacy = request("tools/list", None, &json!({"id":1,"params":{}}), "secret");
+        legacy.headers_mut().insert(
+            PROTOCOL_VERSION_HEADER,
+            http::HeaderValue::from_static("2025-06-18"),
+        );
+        assert_eq!(
+            service.oneshot(legacy).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.unauthenticated, 1);
+        assert_eq!(snapshot.rejected, 1);
     }
 
     #[test]

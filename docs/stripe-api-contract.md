@@ -45,6 +45,13 @@ The workspace uses `reqwest` 0.13.4 with Rustls, no native TLS, and a per-reques
 30-second timeout. Export errors omit response bodies, endpoint URLs, customer
 identifiers, and API keys so provider diagnostics cannot leak through logs.
 Endpoint overrides are restricted to IP-addressed loopback test servers; other
-custom hosts are rejected before a request is sent.
+custom hosts are rejected at construction, before the exporter is usable.
+
+The client refuses redirects. The endpoint allowlist checks the URL the exporter
+is configured with, so following a 3xx would move the request to a host that was
+never checked; `reqwest` strips `Authorization` across hosts, which protects the
+secret key but not the form body carrying `payload[stripe_customer_id]`. Stripe's
+v1 API does not redirect, so no legitimate response is affected, and a redirect
+now surfaces as an ordinary non-2xx status.
 
 Source: [`reqwest` 0.13.4 documentation](https://docs.rs/reqwest/0.13.4/reqwest/).

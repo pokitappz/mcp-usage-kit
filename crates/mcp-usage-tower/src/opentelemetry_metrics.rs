@@ -34,13 +34,18 @@ impl OpenTelemetryMetrics {
 /// Register low-cardinality observable counters with an application-owned meter.
 #[must_use]
 pub fn install_opentelemetry(metrics: &Arc<EdgeMetrics>, meter: &Meter) -> OpenTelemetryMetrics {
-    let definitions: [MetricDefinition; 10] = [
+    let definitions: [MetricDefinition; 11] = [
         ("mcp.usage.classified", "Classified MCP requests", |s| {
             s.classified
         }),
         ("mcp.usage.rejected", "Rejected MCP requests", |s| {
             s.rejected
         }),
+        (
+            "mcp.usage.unauthenticated",
+            "MCP requests refused for an invalid API key",
+            |s| s.unauthenticated,
+        ),
         ("mcp.usage.cache_hits", "MCP response cache hits", |s| {
             s.cache_hits
         }),

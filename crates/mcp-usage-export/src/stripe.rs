@@ -21,10 +21,22 @@ pub struct StripeExporter {
 
 impl StripeExporter {
     /// Construct an exporter targeting Stripe's production API endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TLS backend cannot be initialized, matching the behavior of
+    /// [`reqwest::Client::new`].
     #[must_use]
     pub fn new(secret_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Redirects are refused so the endpoint allowlist is the last word
+            // on where this request goes. Following a 3xx would carry the meter
+            // event, including the customer identifier, to a host that was never
+            // checked.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client with a no-redirect policy"),
             secret_key: secret_key.into(),
             endpoint: DEFAULT_ENDPOINT.to_owned(),
         }
@@ -32,13 +44,29 @@ impl StripeExporter {
 
     /// Override the endpoint for an IP-addressed loopback test server.
     ///
-    /// Export rejects other custom hosts so a configuration error cannot send
-    /// the Stripe secret to an unrelated server.
-    #[must_use]
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
+    /// Only `https://api.stripe.com` and loopback IP literals are accepted, so a
+    /// configuration error cannot send the Stripe secret to an unrelated server.
+    /// The endpoint is checked here rather than at the first flush so a bad value
+    /// fails at startup instead of silently deferring until billing runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportError::Provider`] when the endpoint is not on the
+    /// allowlist.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, ExportError> {
+        let endpoint = endpoint.into();
+        if !endpoint_is_allowed(&endpoint) {
+            return Err(disallowed_endpoint());
+        }
+        self.endpoint = endpoint;
+        Ok(self)
     }
+}
+
+fn disallowed_endpoint() -> ExportError {
+    ExportError::Provider(
+        "Stripe endpoint must be api.stripe.com or a loopback test server".to_owned(),
+    )
 }
 
 impl fmt::Debug for StripeExporter {
@@ -53,10 +81,11 @@ impl fmt::Debug for StripeExporter {
 impl BatchExporter for StripeExporter {
     fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
         Box::pin(async move {
+            // `with_endpoint` already refused anything off the allowlist. This
+            // re-check costs one URL parse per flush and keeps the guarantee
+            // local to the code that actually sends the secret.
             if !endpoint_is_allowed(&self.endpoint) {
-                return Err(ExportError::Provider(
-                    "Stripe endpoint must be api.stripe.com or a loopback test server".to_owned(),
-                ));
+                return Err(disallowed_endpoint());
             }
             for usage in batch {
                 let form = form_fields(usage);
@@ -160,5 +189,29 @@ mod tests {
         assert!(!endpoint_is_allowed(
             "http://api.stripe.com/v1/billing/meter_events"
         ));
+    }
+
+    #[test]
+    fn a_disallowed_endpoint_is_refused_at_construction() {
+        for endpoint in [
+            "https://attacker.example/v1/billing/meter_events",
+            "http://api.stripe.com/v1/billing/meter_events",
+            // Userinfo does not make the host api.stripe.com.
+            "https://api.stripe.com@attacker.example/v1",
+            "not a url",
+        ] {
+            assert!(
+                StripeExporter::new("sk_test_do_not_log")
+                    .with_endpoint(endpoint)
+                    .is_err(),
+                "{endpoint} should be refused before any export runs"
+            );
+        }
+
+        assert!(
+            StripeExporter::new("sk_test_do_not_log")
+                .with_endpoint("http://127.0.0.1:8080/v1/billing/meter_events")
+                .is_ok()
+        );
     }
 }

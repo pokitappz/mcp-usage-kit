@@ -1,0 +1,58 @@
+# cargo-deny configuration.
+#
+# `cargo audit` already covers RustSec advisories. This file covers what it does
+# not: license compliance, where crates are allowed to come from, and structural
+# hygiene of the dependency graph.
+#
+# Every list below was derived from an actual `cargo deny` run over this
+# workspace's lockfile, not from a template. Re-derive rather than guess when
+# adding a dependency:
+#
+#   cargo deny --all-features list
+#   cargo deny --all-features check
+
+[graph]
+# The interesting dependencies are all behind optional features: sqlx and redis
+# for the durable stores, reqwest for the Stripe exporter. Checking only default
+# features would leave the crates that actually reach the network unexamined.
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate is a supply-chain signal in its own right, so it fails here even
+# when no advisory has been filed against it.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The complete set required to satisfy every SPDX expression in the tree. Each
+# entry is load-bearing; nothing here is aspirational.
+allow = [
+    "Apache-2.0",          # the bulk of the tree
+    "MIT",                 # the bulk of the tree
+    "ISC",                 # rustls-webpki, untrusted; also required by ring and aws-lc-rs
+    "BSD-3-Clause",        # redis, subtle; also required by matchit and aws-lc-sys
+    "Unicode-3.0",         # the icu_* family, reached through idna/url
+    "CDLA-Permissive-2.0", # webpki-roots, webpki-root-certs
+    "Zlib",                # foldhash
+    "BSL-1.0",             # xxhash-rust, reached through sqlx
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+# Deliberately a warning, not an error. The resolved graph carries 14 duplicated
+# crates it does not control: getrandom, hashbrown, rand_core, redox_syscall,
+# syn, and the windows-sys/windows-targets family of target shims. Failing the
+# build on those on day one would only get this check switched off. Tighten to
+# "deny" once the duplicates are actually resolved upstream.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Everything must come from crates.io. A git or vendored source appearing in this
+# tree would mean a dependency was redirected somewhere unreviewed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

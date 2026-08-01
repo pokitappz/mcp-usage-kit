@@ -37,7 +37,7 @@ major version or wire format.
 - API crate: `opentelemetry` 0.32.0 with metrics only.
 - Ownership: the application supplies its configured `Meter`; UsageKit does not
   install an SDK, exporter, global provider, or network transport.
-- Instruments: ten pull-based observable counters with fixed names and no
+- Instruments: eleven pull-based observable counters with fixed names and no
   identifying labels.
 - Status: the upstream Rust metrics API is currently marked beta.
 - References: [OpenTelemetry Rust status](https://opentelemetry.io/docs/languages/rust/),

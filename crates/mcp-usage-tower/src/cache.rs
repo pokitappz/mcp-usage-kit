@@ -47,14 +47,16 @@ pub(crate) struct ResponseCache {
     state: Mutex<CacheState>,
     max_entries: usize,
     max_ttl: Duration,
+    share_public: bool,
 }
 
 impl ResponseCache {
-    pub fn new(max_entries: usize, max_ttl: Duration) -> Self {
+    pub fn new(max_entries: usize, max_ttl: Duration, share_public: bool) -> Self {
         Self {
             state: Mutex::new(CacheState::default()),
             max_entries,
             max_ttl,
+            share_public,
         }
     }
 
@@ -108,30 +110,36 @@ impl ResponseCache {
         let Some(expires_at) = now.checked_add(ttl) else {
             return;
         };
+        // An origin declaring `cacheScope: "public"` is asserting the result is
+        // tenant-independent. Honoring that places one entry in a bucket every
+        // authorization context can read, so a single mislabelled result at the
+        // origin becomes a cross-tenant disclosure here. Sharing is therefore
+        // opt-in: without it a public result is stored exactly like a private
+        // one, and caching less than the spec permits is always legal.
+        let effective_public = matches!(scope, CacheScope::Public) && self.share_public;
         let key = CacheKey {
             logical,
-            private_tenant: match scope {
-                CacheScope::Public => None,
-                CacheScope::Private => Some(authorization_context.to_owned()),
-            },
+            private_tenant: (!effective_public).then(|| authorization_context.to_owned()),
         };
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.entries.retain(|_, entry| entry.expires_at > now);
-        match scope {
+        // Invalidation follows where the entry actually landed rather than what
+        // the origin declared. A demoted public result must evict the shared
+        // representation it was meant to supersede, not keep it alive.
+        if effective_public {
             // A newly-public representation supersedes every private
             // representation of the same logical result.
-            CacheScope::Public => state.entries.retain(|existing, _| {
+            state.entries.retain(|existing, _| {
                 existing.logical != logical || existing.private_tenant.is_none()
-            }),
-            CacheScope::Private => {
-                state.entries.remove(&CacheKey {
-                    logical,
-                    private_tenant: None,
-                });
-            }
+            });
+        } else {
+            state.entries.remove(&CacheKey {
+                logical,
+                private_tenant: None,
+            });
         }
         if !state.entries.contains_key(&key)
             && state.entries.len() >= self.max_entries
@@ -249,6 +257,94 @@ pub(crate) fn cache_hints(body: &Value) -> Option<(Duration, CacheScope)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn stored(body: Value) -> CachedResponse {
+        CachedResponse {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body,
+        }
+    }
+
+    fn put(cache: &ResponseCache, tenant: &str, scope: CacheScope, body: Value) {
+        cache.insert(
+            [7; 32],
+            tenant,
+            scope,
+            Duration::from_secs(30),
+            stored(body),
+        );
+    }
+
+    #[test]
+    fn public_results_do_not_cross_authorization_contexts_by_default() {
+        let cache = ResponseCache::new(16, Duration::from_secs(60), false);
+        put(&cache, "tenant-a", CacheScope::Public, json!({"r": "a"}));
+
+        assert!(cache.get([7; 32], "tenant-a", None).is_some());
+        assert!(
+            cache.get([7; 32], "tenant-b", None).is_none(),
+            "an origin declaring `public` must not leak across tenants unless the operator opted in"
+        );
+    }
+
+    #[test]
+    fn public_results_are_shared_once_the_operator_opts_in() {
+        let cache = ResponseCache::new(16, Duration::from_secs(60), true);
+        put(&cache, "tenant-a", CacheScope::Public, json!({"r": "a"}));
+
+        assert_eq!(cache.get([7; 32], "tenant-b", None).unwrap().body["r"], "a");
+    }
+
+    #[test]
+    fn private_results_stay_isolated_regardless_of_the_sharing_switch() {
+        for share_public in [false, true] {
+            let cache = ResponseCache::new(16, Duration::from_secs(60), share_public);
+            put(&cache, "tenant-a", CacheScope::Private, json!({"r": "a"}));
+            assert!(cache.get([7; 32], "tenant-a", None).is_some());
+            assert!(cache.get([7; 32], "tenant-b", None).is_none());
+        }
+    }
+
+    #[test]
+    fn a_later_private_result_evicts_the_shared_representation() {
+        let cache = ResponseCache::new(16, Duration::from_secs(60), true);
+        put(
+            &cache,
+            "tenant-a",
+            CacheScope::Public,
+            json!({"r": "public"}),
+        );
+        assert!(cache.get([7; 32], "tenant-b", None).is_some());
+
+        put(
+            &cache,
+            "tenant-a",
+            CacheScope::Private,
+            json!({"r": "private"}),
+        );
+        assert!(
+            cache.get([7; 32], "tenant-b", None).is_none(),
+            "the superseded shared entry must not outlive its private replacement"
+        );
+        assert_eq!(
+            cache.get([7; 32], "tenant-a", None).unwrap().body["r"],
+            "private"
+        );
+    }
+
+    #[test]
+    fn a_demoted_public_result_does_not_purge_other_tenants() {
+        // With sharing off, one tenant's `public` result is stored privately and
+        // must not evict the entry another tenant already holds.
+        let cache = ResponseCache::new(16, Duration::from_secs(60), false);
+        put(&cache, "tenant-a", CacheScope::Private, json!({"r": "a"}));
+        put(&cache, "tenant-b", CacheScope::Public, json!({"r": "b"}));
+
+        assert_eq!(cache.get([7; 32], "tenant-a", None).unwrap().body["r"], "a");
+        assert_eq!(cache.get([7; 32], "tenant-b", None).unwrap().body["r"], "b");
+    }
 
     #[test]
     fn cache_key_ignores_json_rpc_id_but_includes_cursor() {
