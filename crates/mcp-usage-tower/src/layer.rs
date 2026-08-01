@@ -646,16 +646,63 @@ struct ObservedBody<B> {
     finishing: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     captured: BytesMut,
     overflowed: bool,
+    metrics: Arc<EdgeMetrics>,
 }
 
 impl<B> ObservedBody<B> {
     fn new(inner: B, completion: Completion) -> Self {
+        let metrics = completion.config.metrics.clone();
         Self {
             inner: Box::pin(inner),
             completion: Some(completion),
             finishing: None,
             captured: BytesMut::new(),
             overflowed: false,
+            metrics,
+        }
+    }
+
+    /// Build the terminal-accounting future, consuming the pending completion.
+    ///
+    /// Returns `None` when there is nothing left to account for, either because
+    /// accounting already ran or because the captured body overflowed.
+    fn start_completion(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        let completion = self.completion.take()?;
+        if self.overflowed {
+            completion.config.metrics.unrecognized_response();
+            return None;
+        }
+        let captured = std::mem::take(&mut self.captured).freeze();
+        Some(Box::pin(completion.finish(captured)))
+    }
+}
+
+impl<B> Drop for ObservedBody<B> {
+    /// Account for a response the transport stopped polling before end-of-stream.
+    ///
+    /// A body that declares a `Content-Length` is not polled again once that
+    /// many bytes have been written, so `poll_frame` never observes the
+    /// end-of-stream that terminal accounting used to depend on. That is the
+    /// ordinary case for a fixed-length JSON result, and without this the meter
+    /// records nothing at all. Dropping the body is the one signal every
+    /// transport does give us.
+    ///
+    /// Nothing here may await, so the future is polled once with a no-op waker.
+    /// That is sufficient for every synchronous recorder and for the default
+    /// in-memory task store, whose futures never yield. A store that performs
+    /// real I/O may still be pending, which is counted as a record failure
+    /// rather than passed over in silence.
+    fn drop(&mut self) {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let abandoned = if let Some(finishing) = self.finishing.as_mut() {
+            finishing.as_mut().poll(&mut context).is_pending()
+        } else if let Some(mut finishing) = self.start_completion() {
+            finishing.as_mut().poll(&mut context).is_pending()
+        } else {
+            false
+        };
+        if abandoned {
+            self.metrics.record_failure();
         }
     }
 }
@@ -699,20 +746,14 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(None) => {
-                if let Some(completion) = self.completion.take() {
-                    if self.overflowed {
-                        completion.config.metrics.unrecognized_response();
-                    } else {
-                        let captured = std::mem::take(&mut self.captured).freeze();
-                        let mut finishing = Box::pin(completion.finish(captured));
-                        return match finishing.as_mut().poll(cx) {
-                            Poll::Ready(()) => Poll::Ready(None),
-                            Poll::Pending => {
-                                self.finishing = Some(finishing);
-                                Poll::Pending
-                            }
-                        };
-                    }
+                if let Some(mut finishing) = self.start_completion() {
+                    return match finishing.as_mut().poll(cx) {
+                        Poll::Ready(()) => Poll::Ready(None),
+                        Poll::Pending => {
+                            self.finishing = Some(finishing);
+                            Poll::Pending
+                        }
+                    };
                 }
                 Poll::Ready(None)
             }
@@ -1139,6 +1180,111 @@ mod tests {
         )
         .await;
         assert_eq!(billing.flush().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn accounting_runs_when_the_transport_stops_polling_early() {
+        // A transport is not obliged to poll a body to end-of-stream. hyper
+        // stops as soon as the declared Content-Length has been written, so
+        // `poll_frame` never returns `Poll::Ready(None)` for an ordinary
+        // fixed-length JSON result. Terminal accounting must survive that:
+        // dropping the body is the only signal every transport gives us.
+        //
+        // This deliberately drives the body by hand rather than through
+        // `BodyExt::collect`, which always polls to `None` and would hide the
+        // regression this test exists to catch.
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert(
+            "secret",
+            Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("tool", 7)),
+        );
+        let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,
+                    "result":{"resultType":"complete","content":[]}
+                })))
+            }));
+
+        let response = service
+            .oneshot(request(
+                "tools/call",
+                Some("tool"),
+                &json!({"id":1,"params":{"name":"tool"}}),
+                "secret",
+            ))
+            .await
+            .unwrap();
+
+        let mut body = Box::pin(response.into_body());
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        // Take the single data frame and then stop, exactly as a transport does
+        // once it has satisfied Content-Length.
+        assert!(
+            matches!(
+                body.as_mut().poll_frame(&mut context),
+                Poll::Ready(Some(Ok(_)))
+            ),
+            "expected one data frame"
+        );
+        assert_eq!(
+            metrics.snapshot().billed,
+            0,
+            "nothing should be billed before the body is released"
+        );
+
+        drop(body);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.billed, 1,
+            "the delivery must still be accounted for"
+        );
+        assert_eq!(snapshot.billed_units, 7);
+        assert_eq!(snapshot.record_failures, 0);
+        assert_eq!(billing.pending_buckets(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fully_consumed_body_is_accounted_for_exactly_once() {
+        // The guard against the Drop path double-counting what `poll_frame`
+        // already recorded.
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert(
+            "secret",
+            Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("tool", 5)),
+        );
+        let config = EdgeConfig::new(tenants);
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,
+                    "result":{"resultType":"complete","content":[]}
+                })))
+            }));
+
+        consume(
+            service
+                .oneshot(request(
+                    "tools/call",
+                    Some("tool"),
+                    &json!({"id":1,"params":{"name":"tool"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 1);
+        assert_eq!(snapshot.billed_units, 5);
     }
 
     #[tokio::test]
