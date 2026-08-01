@@ -40,11 +40,21 @@ the application that embeds them.
   restore the exact aggregate quantities, timestamps, and identifiers for retry.
   The buffer remains process-local and does not survive process loss. Strong
   crash durability requires an application-owned durable recorder or outbox.
-- **Stripe reconciliation.** Meter aggregates older than Stripe's accepted
-  timestamp window are retained in the exporter's bounded dead letter queue and
-  must be drained and reconciled by the application. Alert on
-  `StripeExporter::dropped_dead_letters` because a nonzero value means the queue
-  evicted reconciliation data.
+- **Stripe reconciliation.** Meter aggregates outside Stripe's accepted
+  timestamp window and events synchronously rejected as permanently invalid are
+  retained in the exporter's bounded dead letter queue. Stripe can also accept
+  an event and reject it later during asynchronous processing. Applications
+  must verify Stripe's thin event signature, correlate the failure with their
+  source usage, pass the original aggregate to
+  `StripeExporter::quarantine_async_rejection`, and drain the queue for
+  reconciliation. Alert on `StripeExporter::dropped_dead_letters` because a
+  nonzero value means the queue evicted reconciliation data.
+- **Stripe partial retries.** A transient failure after one or more confirmed
+  successes retains process-local progress and requires the identical batch on
+  retry. Confirmed events are skipped; the unresolved in-flight event keeps its
+  stable identifier. Process loss also loses this progress, so applications
+  that require crash-durable reconciliation must retain their own source audit
+  trail.
 - **Cross-tenant cache sharing.** `EdgeConfig::with_public_cache_sharing` is off
   by default. Turning it on trusts every origin behind the layer to use
   `cacheScope: "public"` only for results that genuinely do not depend on the

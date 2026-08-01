@@ -85,10 +85,16 @@ application-owned exporter when exported batches must be captured.
 
 Enable the Stripe exporter with the `stripe` feature on `mcp-usage-export`. It
 submits pre-aggregated integer quantities to Stripe's Billing Meter Events API.
-Aggregates older than Stripe's 35-day timestamp window enter a bounded dead
-letter queue without timestamp rewriting, while fresh aggregates continue.
-Applications can reconcile them through `StripeExporter::take_dead_letters` and
-should alert on `dropped_dead_letters`.
+Aggregates outside Stripe's accepted timestamp window and individual events
+synchronously rejected as permanently invalid enter a bounded dead letter queue
+without timestamp rewriting, while valid aggregates continue. After verifying
+and correlating Stripe's asynchronous failure events, applications can retain
+the original aggregate with `StripeExporter::quarantine_async_rejection`.
+Reconcile entries through `take_dead_letters` and alert on
+`dropped_dead_letters`.
+If a transient failure interrupts a batch after earlier events succeeded, the
+exporter resumes the identical retry batch after those confirmed events instead
+of submitting them again.
 The verified API contract and dashboard assumptions are recorded in
 [`docs/stripe-api-contract.md`](docs/stripe-api-contract.md).
 

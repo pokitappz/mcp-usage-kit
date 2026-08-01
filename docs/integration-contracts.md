@@ -63,8 +63,22 @@ The verified Meter Events HTTP contract, authentication format, retry identity,
 endpoint restrictions, and dashboard-only setup are documented separately in
 [`stripe-api-contract.md`](stripe-api-contract.md).
 
-Aggregates strictly older than Stripe's 35-day timestamp window are never sent
-with a rewritten timestamp. They enter a bounded, identifier-deduplicated dead
-letter queue for application-owned reconciliation while fresh aggregates in the
-same batch continue exporting. Transport and provider failures remain retryable
-with the original identifiers.
+Aggregates outside Stripe's timestamp window and events synchronously rejected
+as permanently invalid are never retried with rewritten timestamps. They enter
+a bounded, identifier-deduplicated dead letter queue for application-owned
+reconciliation while valid aggregates in the same batch continue exporting.
+Transport failures, authentication failures, rate limits, external dependency
+failures, and server errors remain retryable with their original identifiers.
+
+Stripe processes Meter Events asynchronously and can report a rejection after
+the create request succeeds. The application owns the verified Stripe thin
+event receiver and source-record correlation. Once correlated, it passes the
+original aggregate to `StripeExporter::quarantine_async_rejection` so the same
+bounded reconciliation path covers both synchronous and asynchronous failures.
+
+If a transient response interrupts a batch after earlier events received
+successful responses, the exporter retains process-local progress. Retrying the
+identical batch skips those confirmed events and resumes at the first unresolved
+event. A different batch is refused until the incomplete one finishes. The
+currently in-flight event may have an ambiguous outcome, so its stable Stripe
+identifier is reused.
