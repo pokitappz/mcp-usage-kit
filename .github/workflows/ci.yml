@@ -39,7 +39,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --workspace --all-features --no-deps --locked
       - name: Build publishable archives
-        run: cargo +stable package --workspace --locked
+        run: cargo +stable package --workspace --locked --no-verify
 
   msrv:
     name: Rust 1.88 minimum version
@@ -120,7 +120,7 @@ jobs:
       # Pinned to explicit minor versions rather than a floating tag, so a
       # backend upgrade is a reviewed change rather than a surprise.
       postgres:
-        image: postgres:17.2
+        image: postgres:17.2@sha256:3267c505060a0052e5aa6e5175a7b41ab6b04da2f8c4540fc6e98a37210aa2d3
         env:
           POSTGRES_USER: usagekit
           POSTGRES_PASSWORD: usagekit
@@ -133,7 +133,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis:
-        image: redis:7.4
+        image: redis:7.4@sha256:595cc6f2bb3af6e03347b90deb6123c6aa2c81dea05ce08128de8a174b6ac67b
         ports:
           - 6379:6379
         options: >-

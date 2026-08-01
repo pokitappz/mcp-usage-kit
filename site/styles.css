@@ -91,6 +91,56 @@ a { color: inherit; }
 
 svg { display: block; }
 
+.not-found-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #0d1b15;
+  color: #eef6f0;
+}
+
+.not-found-card {
+  width: min(560px, calc(100% - 40px));
+  padding: 48px;
+  border: 1px solid #385044;
+  border-radius: 18px;
+  background: #102219;
+}
+
+.not-found-code {
+  color: #72dcae;
+  font: 700 0.8rem ui-monospace, monospace;
+  text-transform: uppercase;
+}
+
+.not-found-card h1 {
+  margin: 12px 0;
+  font-size: clamp(2.5rem, 8vw, 4.5rem);
+  letter-spacing: -0.06em;
+  line-height: 1;
+}
+
+.not-found-card p {
+  color: #a8b9ae;
+  line-height: 1.6;
+}
+
+.not-found-link {
+  display: inline-block;
+  margin-top: 18px;
+  padding: 12px 18px;
+  border-radius: 9px;
+  background: #72dcae;
+  color: #082016;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.not-found-link:focus-visible {
+  outline: 3px solid #ffffff;
+  outline-offset: 3px;
+}
+
 .skip-link {
   position: fixed;
   left: 16px;

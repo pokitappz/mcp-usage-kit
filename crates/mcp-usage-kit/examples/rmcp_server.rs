@@ -1,4 +1,4 @@
-//! Run with: `MCP_API_KEY=development-key cargo run -p mcp-usage-kit --example rmcp_server`.
+//! Run with: `MCP_API_KEY="$(openssl rand -base64 32)" cargo run -p mcp-usage-kit --example rmcp_server`.
 
 use std::sync::Arc;
 
@@ -115,12 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     () = cancellation.cancelled() => break,
                 }
             }
-            // Drain once more on the way out, so a departing process does not
-            // take durable-task charges with it.
-            deferred.drain().await;
-            if let Err(error) = billing.flush().await {
-                eprintln!("final billing flush failed: {error}");
-            }
         }
     });
 
@@ -136,6 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     flush.await?;
+    // Graceful shutdown has now released every response body, so all terminal
+    // work that can be parked is visible before the final drain begins.
+    deferred.drain().await;
     billing.flush().await?;
     Ok(())
 }

@@ -18,7 +18,8 @@ the application that embeds them.
   source address belongs to the transport and forwarding headers are attacker
   controlled, so per-address limits belong in the proxy in front of it. Alert on
   `mcp_usage_throttled_total` and `mcp_usage_unauthenticated_total`, both counted
-  separately from malformed-header rejections.
+  separately from malformed-header rejections. The builder returns
+  `InvalidAuthFailureWindow` for a zero-duration window.
 - **API-key entropy.** Keys are compared by SHA-256 digest, which is a lookup
   hash and not a password hash, so it protects only a secret that was hard to
   guess to begin with. `InMemoryTenantStore::insert` refuses obviously weak keys;
@@ -29,16 +30,31 @@ the application that embeds them.
   `openssl rand -base64 32`.
 - **Durable-task accounting.** With a Redis or `PostgreSQL` task store, terminal
   accounting that cannot finish synchronously is parked on
-  `EdgeConfig::deferred`. Subsequent requests drain it automatically, but drain
-  it explicitly on shutdown so a departing process does not take durable-task
-  charges with it. Alert on `DeferredCompletions::dropped`, which is nonzero only
-  when usage was discarded because the queue was full.
+  `EdgeConfig::deferred`. Authenticated requests drain it automatically;
+  malformed and unauthenticated traffic cannot trigger backend work. A
+  cancelled drain requeues its in-flight completion. Drain explicitly after the
+  server has completed graceful shutdown so a departing process does not take
+  durable-task charges with it. Alert on `DeferredCompletions::dropped`, which
+  is nonzero only when usage was discarded because the queue was full.
+- **Billing durability.** Cancellation and panic during `BillingPipeline::flush`
+  restore the exact aggregate quantities, timestamps, and identifiers for retry.
+  The buffer remains process-local and does not survive process loss. Strong
+  crash durability requires an application-owned durable recorder or outbox.
+- **Stripe reconciliation.** Meter aggregates older than Stripe's accepted
+  timestamp window are retained in the exporter's bounded dead letter queue and
+  must be drained and reconciled by the application. Alert on
+  `StripeExporter::dropped_dead_letters` because a nonzero value means the queue
+  evicted reconciliation data.
 - **Cross-tenant cache sharing.** `EdgeConfig::with_public_cache_sharing` is off
   by default. Turning it on trusts every origin behind the layer to use
   `cacheScope: "public"` only for results that genuinely do not depend on the
   caller.
 - **Transport.** The layer is TLS-agnostic on the inbound side. Terminate TLS in
   front of it, and note that the bundled examples bind loopback only.
+- **Identifier pseudonymization.** Durable stores use deterministic SHA-256 keys.
+  This keeps plaintext identifiers out of backend key names but does not prevent
+  dictionary recovery of low-entropy values. A keyed-hash migration requires a
+  coordinated key-format rollout and is not part of the current API.
 
 ## Reporting a vulnerability
 

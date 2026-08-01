@@ -52,7 +52,7 @@ for the wire-level reasoning and specification links.
 ## Run the example
 
 ```sh
-MCP_API_KEY=development-key cargo run -p mcp-usage-kit --example rmcp_server
+MCP_API_KEY="$(openssl rand -base64 32)" cargo run -p mcp-usage-kit --example rmcp_server
 ```
 
 The example exposes an `rmcp` Streamable HTTP service at
@@ -79,10 +79,16 @@ let metered_rmcp_service = MeterLayer::new(edge).layer(rmcp_service);
 
 Call `BillingPipeline::flush` from a background task. Export failures retain the
 same aggregate quantity and provider event identifier for the next retry; they
-never change an MCP response.
+never change an MCP response. Cancellation and panic restore the in-progress
+batch through a drop guard. `LogExporter` is stateless and logging-only; use an
+application-owned exporter when exported batches must be captured.
 
 Enable the Stripe exporter with the `stripe` feature on `mcp-usage-export`. It
 submits pre-aggregated integer quantities to Stripe's Billing Meter Events API.
+Aggregates older than Stripe's 35-day timestamp window enter a bounded dead
+letter queue without timestamp rewriting, while fresh aggregates continue.
+Applications can reconcile them through `StripeExporter::take_dead_letters` and
+should alert on `dropped_dead_letters`.
 The verified API contract and dashboard assumptions are recorded in
 [`docs/stripe-api-contract.md`](docs/stripe-api-contract.md).
 
@@ -134,14 +140,15 @@ languages.
   rejections, so credential stuffing is distinguishable in the metrics.
   `EdgeConfig::with_auth_failure_limit` bounds sustained guessing across the
   edge; only failures consume the budget, so enabling it cannot lock out callers
-  holding valid keys. Per-address limits still belong in the proxy in front,
-  because the edge has no client identity it can trust.
+  holding valid keys. It returns an error for a zero-duration window. Per-address
+  limits still belong in the proxy in front, because the edge has no client
+  identity it can trust.
 - `InMemoryTenantStore::insert` refuses obviously weak API keys, since a digest
   lookup only protects a secret that was hard to guess. `insert_unchecked` is the
   explicit escape hatch for fixtures.
 - Durable-task accounting that cannot finish synchronously is parked on
-  `EdgeConfig::deferred` rather than dropped. Later requests drain it
-  automatically; drain it explicitly on shutdown.
+  `EdgeConfig::deferred` rather than dropped. Later authenticated requests drain
+  it automatically; drain it explicitly after graceful shutdown.
 - W3C `traceparent` headers pass through unchanged.
 - The default request body cap is 1 MiB. Oversized requests are rejected with
   `413 Payload Too Large`; configure it with `EdgeConfig::with_max_request_body`.

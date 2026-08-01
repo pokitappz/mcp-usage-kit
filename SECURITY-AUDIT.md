@@ -5,11 +5,11 @@
 `mcp-usage-store`, `mcp-usage-export`, `mcp-usage-kit`) and its complete
 dependency tree at the `Cargo.lock` pinned in this commit.
 
-This audit was run before first publication to crates.io. It found **no
-known-vulnerable dependencies and no exploitable defects**. Every finding below
-is a hardening change: closing the distance between what the code guarantees and
-what its documentation claimed, and adding supply-chain gates that advisory
-scanning alone does not provide.
+This audit was run before first publication to crates.io. It found **no Critical
+or High exploitable vulnerability and no known-vulnerable dependency**. The
+Medium findings could lose billable usage, retain unbounded process memory, or
+expose identifiers through Debug output. They are fixed below without adding a
+database schema, persistent outbox, or provider-specific runtime dependency.
 
 ---
 
@@ -87,6 +87,14 @@ Two observations that are not defects but are worth tracking:
 | H4 | Edge-generated responses set no `nosniff` or cache directives | Informational | Fixed |
 | H5 | Credential failures were indistinguishable from header failures in metrics | Informational | Fixed |
 | H6 | No license, source, or ban gates; Actions floated on mutable tags | Low (supply chain) | Fixed |
+| H7 | Cancelling or unwinding a billing flush discarded the owned batch | Medium (billing loss) | Fixed |
+| H8 | Cancelling a deferred drain discarded removed futures | Medium (billing loss) | Fixed |
+| H9 | In-memory task ordering metadata grew across repeated claims | Medium (memory exhaustion) | Fixed |
+| H10 | Derived Debug output exposed buffered identifiers | Medium (privacy) | Fixed |
+| H11 | Recorder rejection after a durable claim consumed attribution | Medium (billing loss) | Fixed |
+| H12 | Stripe could not accept events older than its 35-day window | Medium (billing loss) | Fixed |
+| H13 | Redis accepted TTLs outside its signed expiry representation | Low | Fixed |
+| H14 | The 404 page lacked CSP and embedded styling | Low | Fixed |
 
 ### H1 - Public cache scope crossed the tenant boundary
 
@@ -164,6 +172,43 @@ mutable tag to a commit SHA, which matters most in `release.yml` because it hold
 a daily schedule, so an advisory published after the last merge is caught rather
 than waiting for the next push.
 
+### H7-H12 - Billing ownership, memory bounds, and privacy
+
+`BillingPipeline::flush` moved its retry batch into the async future but only
+restored it on an ordinary `Err`. Cancellation or panic dropped the quantities
+and stable provider identifiers. A retry guard now owns the batch until export
+commits and restores it from `Drop` on every incomplete exit.
+
+Deferred draining similarly removed multiple futures before awaiting the first.
+It now claims one future at a time and uses a drop guard to requeue an in-flight
+future when the drain is cancelled. Automatic draining happens only after a
+credential authenticates, so malformed or unauthenticated requests cannot use
+the edge to trigger durable-store work.
+
+Successful in-memory task claims left stale insertion-order records behind.
+Claims and removals now compact that metadata once it grows beyond roughly twice
+the configured live capacity. If the recorder rejects a charge after an atomic
+task claim, the original call attribution is reinserted so a later terminal poll
+can recover it.
+
+Derived Debug implementations on the usage buffer and pipeline traversed
+pending maps and aggregates, exposing tenant, customer, and task identifiers.
+Their Debug output is now count-only and does not traverse exporter state.
+
+Stripe rejects Meter Events strictly older than 35 calendar days. Repeating
+those requests cannot succeed, while changing their timestamps corrupts the
+billing period. The exporter now quarantines stale aggregates in a bounded,
+identifier-deduplicated dead letter queue, continues sending fresh aggregates,
+and exposes both retrieval and eviction counts for reconciliation.
+
+### H13-H14 - Configuration and static-site hardening
+
+Redis expiry arguments use a signed 64-bit integer representation. Oversized
+durations are now rejected before URL parsing or connection work. Both static
+pages now declare restrictive CSP policies, the 404 page uses the external
+stylesheet, and the site check rejects inline scripts, event handlers,
+JavaScript URLs, and inline styles.
+
 ---
 
 ## Verified controls
@@ -190,17 +235,19 @@ the code, not inferred from documentation.
 - API keys are stored and compared as SHA-256 digests, never plaintext. The
   plaintext is reduced to a digest immediately after authentication and is never
   retained on the completion record.
-- All four secret-bearing types (`InMemoryTenantStore`, `StripeExporter`,
-  `RedisTaskStore`, `PostgresTaskStore`) have hand-written `Debug` impls that
-  redact, each with a test asserting the secret is absent from the output.
+- Secret-bearing stores and exporters have hand-written, redacted `Debug`
+  implementations. `UsageBuffer` and `BillingPipeline` expose counts only, with
+  regression tests asserting that tenant, customer, task, endpoint, and API-key
+  values are absent.
 - Connection URLs are never stored on the store structs. Backend errors are
   collapsed to fixed enum variants before they escape, so no DSN, endpoint, query
   text, or provider response body can reach a log.
 - Durable stores persist SHA-256 digests of tenant and task identifiers, never
   plaintext.
-- No logging call emits a secret, identifier, request body, or response body.
-  Metrics carry fixed names and an empty attribute set, so cardinality and
-  privacy risk stay bounded.
+- No logging call emits a secret, tenant, customer, task, request body, or
+  response body. The logging exporter includes only its random aggregate
+  identifier, meter name, quantity, and timestamp. Metrics carry fixed names and
+  an empty attribute set, so cardinality and privacy risk stay bounded.
 
 **Protocol and trust boundaries**
 
@@ -256,6 +303,14 @@ Stated plainly, so deployers can make their own call:
   since a source address belongs to the transport and forwarding headers are
   attacker controlled. Per-address limits belong in the proxy in front of this.
   See `SECURITY.md`.
+- **The in-memory billing pipeline is not crash durable.** Cancellation and
+  unwinding restore an in-process batch, but process loss still loses memory.
+  Strong crash durability requires an application-owned persistent recorder or
+  a future outbox design.
+- **Deterministic store hashes are pseudonyms, not encryption.** SHA-256 keeps
+  plaintext tenant and task identifiers out of backend keys, but low-entropy
+  values remain subject to dictionary recovery. A keyed-hash migration requires
+  a coordinated key-format rollout and is outside this pre-release cleanup.
 - **API-key entropy is checked heuristically, not enforced cryptographically.**
   `InMemoryTenantStore::insert` now refuses obviously weak keys through
   `validate_api_key_strength`, which measures length, alphabet size, and the

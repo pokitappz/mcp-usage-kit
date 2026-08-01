@@ -12,11 +12,15 @@ major version or wire format.
 - Timeouts: connection and command operations default to two seconds and can be
   configured with `RedisTaskStore::connect_with_timeout`.
 - Writes: `SET key value NX EX seconds` preserves the first task origin and
-  expires abandoned tasks.
+  expires abandoned tasks. TTLs are validated as positive signed 64-bit seconds
+  before the client parses a URL or opens a connection, matching Redis integer
+  expiry arguments.
 - Claims: a single `EVAL` operation reads and deletes the task origin atomically.
 - Privacy: keys contain SHA-256 digests of tenant and task IDs, never plaintext.
-- References: [Redis Rust client guidance](https://redis.io/docs/latest/develop/clients/rust/json/),
-  [`redis` connection manager API](https://docs.rs/redis/1.5.0/redis/aio/struct.ConnectionManager.html).
+- References: [Redis `SET`](https://redis.io/docs/latest/commands/set/),
+  [Redis signed integer representation](https://redis.io/docs/latest/develop/reference/protocol-spec/),
+  [Redis Rust client guidance](https://redis.io/docs/latest/develop/clients/rust/json/),
+  and the [`redis` connection manager API](https://docs.rs/redis/1.5.0/redis/aio/struct.ConnectionManager.html).
 
 ## PostgreSQL
 
@@ -37,7 +41,7 @@ major version or wire format.
 - API crate: `opentelemetry` 0.32.0 with metrics only.
 - Ownership: the application supplies its configured `Meter`; UsageKit does not
   install an SDK, exporter, global provider, or network transport.
-- Instruments: eleven pull-based observable counters with fixed names and no
+- Instruments: thirteen pull-based observable counters with fixed names and no
   identifying labels.
 - Status: the upstream Rust metrics API is currently marked beta.
 - References: [OpenTelemetry Rust status](https://opentelemetry.io/docs/languages/rust/),
@@ -48,3 +52,9 @@ major version or wire format.
 The verified Meter Events HTTP contract, authentication format, retry identity,
 endpoint restrictions, and dashboard-only setup are documented separately in
 [`stripe-api-contract.md`](stripe-api-contract.md).
+
+Aggregates strictly older than Stripe's 35-day timestamp window are never sent
+with a rewritten timestamp. They enter a bounded, identifier-deduplicated dead
+letter queue for application-owned reconciliation while fresh aggregates in the
+same batch continue exporting. Transport and provider failures remain retryable
+with the original identifiers.

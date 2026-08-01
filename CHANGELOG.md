@@ -7,6 +7,50 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- `LogExporter` is now a stateless logging sink. Tests and applications that
+  need captured batches should provide their own `BatchExporter`.
+- `EdgeConfig::with_auth_failure_limit` returns `Result` and rejects a
+  zero-duration window with `EdgeConfigError::InvalidAuthFailureWindow`.
+- `UsageBuffer`, `BillingPipeline`, and exporter Debug output now exposes counts
+  and configuration bounds only, without buffered identifiers or payloads.
+
+### Added
+
+- `StripeExporter` retains aggregates strictly older than Stripe's 35-day Meter
+  Event window in a bounded dead letter queue. `StripeDeadLetter`,
+  `StripeDeadLetterReason`, `with_dead_letter_capacity`, `dead_letter_count`,
+  `dropped_dead_letters`, and `take_dead_letters` support explicit
+  reconciliation without rewriting timestamps.
+
+### Fixed
+
+- Cancelling or unwinding an in-progress `BillingPipeline::flush` restores the
+  exact batch, including quantities and stable identifiers, before another
+  flush can begin.
+- Cancelling `DeferredCompletions::drain` requeues the in-flight future instead
+  of losing it. Automatic draining now starts only after authentication, so
+  malformed and unauthenticated traffic cannot trigger backend work.
+- A claimed durable-task origin is restored when the usage recorder rejects the
+  charge, allowing a later terminal poll to retry it.
+- Repeated in-memory task insert and claim cycles compact stale insertion-order
+  records and keep bookkeeping bounded near twice the configured live capacity.
+- SSE parsing normalizes CRLF, LF, and bare CR event-stream line endings.
+- Redis and Valkey TTLs larger than a signed 64-bit expiry argument are rejected
+  before any connection attempt.
+- The final example drain runs only after graceful server shutdown has released
+  all response bodies, and the example command now supplies a key accepted by
+  the entropy validator.
+
+### Security
+
+- Both static pages declare restrictive Content Security Policies. The 404 page
+  no longer embeds CSS, and site checks reject inline executable content.
+- CI backend images are pinned by digest as well as version. First-release
+  archive inspection uses `cargo package --workspace --locked --no-verify`,
+  while dependency-ordered publishing retains Cargo's verification step.
+
 ### Fixed
 
 - Durable-task accounting is no longer lost when a task store performs real I/O.
@@ -48,10 +92,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the same surface live in `fuzz/`, outside the workspace because libFuzzer
   requires nightly, and are built and smoke-run by CI so they cannot rot.
 - `EdgeConfig::deferred` exposes the queue of terminal accounting that could not
-  finish synchronously, with `drain` and `drain_some`. Every subsequent request
-  runs a bounded number automatically, so an application that ignores it still
-  converges; draining explicitly is timelier, and draining on shutdown stops a
-  departing process from taking durable-task charges with it. Tunable through
+  finish synchronously, with `drain` and `drain_some`. Every subsequent
+  authenticated request runs a bounded number automatically, so an application
+  that ignores it still converges; draining explicitly is timelier, and draining
+  after graceful shutdown stops a departing process from taking durable-task
+  charges with it. Tunable through
   `EdgeConfig::with_deferred_capacity` and
   `EdgeConfig::with_deferred_drain_per_request`. No runtime dependency is
   introduced: nothing is spawned.

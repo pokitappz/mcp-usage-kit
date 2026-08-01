@@ -1,11 +1,13 @@
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{Request, header::CONTENT_TYPE};
 use http_body_util::{BodyExt, Full};
+use mcp_usage_kit::export::ExportFuture;
 use mcp_usage_kit::{
-    BillingPipeline, EdgeConfig, InMemoryTenantStore, LogExporter, MeterLayer, PriceBook, Tenant,
+    AggregatedUsage, BatchExporter, BillingPipeline, EdgeConfig, InMemoryTenantStore, MeterLayer,
+    PriceBook, Tenant,
 };
 use rmcp::{
     ServerHandler,
@@ -19,6 +21,32 @@ use rmcp::{
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, ServiceExt};
+
+#[derive(Debug, Default)]
+struct CaptureExporter {
+    exported: Mutex<Vec<AggregatedUsage>>,
+}
+
+impl CaptureExporter {
+    fn exported(&self) -> Vec<AggregatedUsage> {
+        self.exported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl BatchExporter for CaptureExporter {
+    fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+        Box::pin(async move {
+            self.exported
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(batch);
+            Ok(())
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SumRequest {
@@ -62,7 +90,7 @@ async fn real_rmcp_tool_call_records_the_configured_units() {
         "test-key",
         Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("sum", 7)),
     );
-    let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
+    let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
     let rmcp = StreamableHttpService::<Calculator, LocalSessionManager>::new(
         || Ok(Calculator::new()),
         Default::default(),

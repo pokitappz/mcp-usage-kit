@@ -5,25 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex">
     <meta name="color-scheme" content="light dark">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'none'; img-src 'self' data:; connect-src 'none'; base-uri 'self'; form-action 'none'">
     <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
     <title>Page not found | UsageKit for MCP</title>
-    <style>
-      :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
-      body { min-height: 100vh; display: grid; place-items: center; margin: 0; background: #0d1b15; color: #eef6f0; }
-      main { width: min(560px, calc(100% - 40px)); padding: 48px; border: 1px solid #385044; border-radius: 18px; background: #102219; }
-      p:first-child { color: #72dcae; font: 700 0.8rem ui-monospace, monospace; text-transform: uppercase; }
-      h1 { margin: 12px 0; font-size: clamp(2.5rem, 8vw, 4.5rem); letter-spacing: -0.06em; line-height: 1; }
-      p { color: #a8b9ae; line-height: 1.6; }
-      a { display: inline-block; margin-top: 18px; padding: 12px 18px; border-radius: 9px; background: #72dcae; color: #082016; font-weight: 750; text-decoration: none; }
-      a:focus-visible { outline: 3px solid #ffffff; outline-offset: 3px; }
-    </style>
   </head>
-  <body>
-    <main>
-      <p>Error 404</p>
+  <body class="not-found-page">
+    <main class="not-found-card">
+      <p class="not-found-code">Error 404</p>
       <h1>Page not found.</h1>
       <p>The requested page does not exist.</p>
-      <a href="./">Return to UsageKit</a>
+      <a class="not-found-link" href="./">Return to UsageKit</a>
     </main>
   </body>
 </html>
