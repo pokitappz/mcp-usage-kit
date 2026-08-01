@@ -7,7 +7,58 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Durable-task accounting is no longer lost when a task store performs real I/O.
+  Terminal accounting runs as the response body is released, which happens in
+  `Drop`, where nothing may await. The in-process store never yields so it always
+  finished there, but a Redis or `PostgreSQL` store pends on its first poll and
+  the work was abandoned. Measured against Redis over real HTTP, a complete
+  durable-task lifecycle recorded `billed=0` with nothing written to the store at
+  all: the attribution `insert` never landed, so the completing poll had nothing
+  to price. Every durable-task charge was lost, in exactly the horizontally
+  scaled deployment those stores exist for. Unfinished accounting is now parked
+  on `DeferredCompletions` and driven from a context that can await.
+
+### Security
+
+- `InMemoryTenantStore::insert` refuses obviously weak API keys, and returns
+  `Result`. Keys are compared by SHA-256 digest, which is a lookup hash rather
+  than a password hash, so it only protects a secret that was hard to guess to
+  begin with. `validate_api_key_strength` is public for validating keys wherever
+  they are loaded, and `insert_unchecked` is the explicit escape hatch for
+  fixtures and for keys validated elsewhere. The check is a guardrail against
+  mistakes, not a strength certificate.
+- `EdgeConfig::with_auth_failure_limit` bounds sustained credential guessing
+  across the edge. Disabled by default. Only failures consume the budget, so
+  enabling it cannot lock out callers holding valid keys: exhausting it turns a
+  wrong key's `401` into a `429` and nothing else. This is not per-client
+  limiting, which needs a client identity the edge cannot trust.
+- The workspace links one rustls crypto provider instead of two. `reqwest` and
+  `redis` both pin aws-lc-rs with no way to choose otherwise, so `sqlx` moved
+  from `tls-rustls-ring` to `tls-rustls-aws-lc-rs`, which is the only direction
+  that removes a backend. `ring` is no longer compiled.
+
 ### Added
+
+- Property tests covering every parser that reads untrusted input: the SSE
+  terminal-response reader, the JSON request and response peeks, the base64
+  `Mcp-Name` sentinel decoder, the protocol-version guard, and the request
+  inspector. They run on stable in ordinary CI. Coverage-guided fuzz targets for
+  the same surface live in `fuzz/`, outside the workspace because libFuzzer
+  requires nightly, and are built and smoke-run by CI so they cannot rot.
+- `EdgeConfig::deferred` exposes the queue of terminal accounting that could not
+  finish synchronously, with `drain` and `drain_some`. Every subsequent request
+  runs a bounded number automatically, so an application that ignores it still
+  converges; draining explicitly is timelier, and draining on shutdown stops a
+  departing process from taking durable-task charges with it. Tunable through
+  `EdgeConfig::with_deferred_capacity` and
+  `EdgeConfig::with_deferred_drain_per_request`. No runtime dependency is
+  introduced: nothing is spawned.
+- A `deferred` counter, exposed as `mcp_usage_deferred_completions_total` and the
+  `mcp.usage.deferred_completions` OpenTelemetry instrument, plus
+  `DeferredCompletions::dropped` reporting accounting discarded because the queue
+  was full.
 
 - Integration tests exercising the Redis and `PostgreSQL` task stores against
   real backends, covering the invariants billing correctness rests on: a task

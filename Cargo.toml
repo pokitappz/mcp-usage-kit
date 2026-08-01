@@ -49,7 +49,13 @@ tracing = "0.1.44"
 uuid = { version = "1.24.0", features = ["v4"] }
 opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
 redis = { version = "1.5.0", default-features = false, features = ["connection-manager", "tokio-rustls-comp"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring"] }
+# `tls-rustls-aws-lc-rs`, not the `ring` variant, so the workspace links one
+# rustls crypto provider instead of two. `reqwest` (`rustls` implies
+# `__rustls-aws-lc-rs`) and `redis` (`tokio-rustls-comp` takes rustls with its
+# default provider) both pin aws-lc-rs and expose no way to choose otherwise, so
+# sqlx is the only dependency that can move, and aws-lc-rs is the only direction
+# that removes a backend rather than adding one.
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 
 # Testing
 proptest = "1.8.0"

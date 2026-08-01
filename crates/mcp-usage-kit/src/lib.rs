@@ -13,7 +13,7 @@
 //! # });
 //!
 //! let tenants = Arc::new(InMemoryTenantStore::new());
-//! tenants.insert("development-key", Tenant::new("acme", "cus_acme"));
+//! tenants.insert_unchecked("development-key", Tenant::new("acme", "cus_acme"));
 //! let metered = MeterLayer::new(EdgeConfig::new(tenants)).layer(rmcp_service);
 //! # let _ = metered;
 //! ```
@@ -37,8 +37,9 @@ pub use mcp_usage_export::{
     NoopRecorder, RecordOutcome, SharedExporter, UsageEvent, UsageRecorder,
 };
 pub use mcp_usage_tower::{
-    EdgeConfig, EdgeMetrics, InMemoryTaskStore, InMemoryTenantStore, MeterLayer, MeterService,
-    MetricsSnapshot, TaskAttributionStore, TaskStoreError, TaskStoreFuture, Tenant, TenantStore,
+    DeferredCompletions, EdgeConfig, EdgeMetrics, InMemoryTaskStore, InMemoryTenantStore,
+    MIN_API_KEY_BYTES, MeterLayer, MeterService, MetricsSnapshot, TaskAttributionStore,
+    TaskStoreError, TaskStoreFuture, Tenant, TenantStore, WeakApiKey, validate_api_key_strength,
 };
 
 #[cfg(feature = "opentelemetry")]

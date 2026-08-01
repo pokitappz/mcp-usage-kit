@@ -10,14 +10,29 @@ first stable release, fixes may require upgrading to the newest 0.x release.
 These crates are middleware, not a service. Some controls can only be applied by
 the application that embeds them.
 
-- **Rate limiting.** The edge authenticates an API key on every request but does
-  not throttle failures, so nothing here bounds a credential-stuffing attempt.
-  Stack a Tower rate-limit layer ahead of `MeterLayer` and alert on
-  `mcp_usage_unauthenticated_total`, which counts credential failures separately
-  from malformed-header rejections.
+- **Rate limiting.** `EdgeConfig::with_auth_failure_limit` bounds sustained
+  credential guessing across the edge. It is disabled by default, because the
+  useful ceiling depends on how many clients you serve. Only failures consume the
+  budget, so enabling it cannot lock out callers holding valid keys. It is not
+  per-client limiting: the edge has no client identity it can trust, since a
+  source address belongs to the transport and forwarding headers are attacker
+  controlled, so per-address limits belong in the proxy in front of it. Alert on
+  `mcp_usage_throttled_total` and `mcp_usage_unauthenticated_total`, both counted
+  separately from malformed-header rejections.
 - **API-key entropy.** Keys are compared by SHA-256 digest, which is a lookup
-  hash and not a password hash. That is appropriate only for high-entropy
-  secrets; generate keys from a CSPRNG rather than accepting user-chosen values.
+  hash and not a password hash, so it protects only a secret that was hard to
+  guess to begin with. `InMemoryTenantStore::insert` refuses obviously weak keys;
+  `insert_unchecked` bypasses that for fixtures and for keys validated at the
+  boundary where they are issued. The check is a guardrail against mistakes, not
+  a strength certificate: it cannot see structure, so a long repeating pattern
+  drawn from a wide alphabet passes. Generate keys from a CSPRNG, for example
+  `openssl rand -base64 32`.
+- **Durable-task accounting.** With a Redis or `PostgreSQL` task store, terminal
+  accounting that cannot finish synchronously is parked on
+  `EdgeConfig::deferred`. Subsequent requests drain it automatically, but drain
+  it explicitly on shutdown so a departing process does not take durable-task
+  charges with it. Alert on `DeferredCompletions::dropped`, which is nonzero only
+  when usage was discarded because the queue was full.
 - **Cross-tenant cache sharing.** `EdgeConfig::with_public_cache_sharing` is off
   by default. Turning it on trusts every origin behind the layer to use
   `cacheScope: "public"` only for results that genuinely do not depend on the

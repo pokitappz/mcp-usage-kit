@@ -15,7 +15,7 @@ use tower::{Layer, service_fn};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tenants = Arc::new(InMemoryTenantStore::new());
-    tenants.insert("development-key", Tenant::new("local", "customer-local"));
+    tenants.insert_unchecked("development-key", Tenant::new("local", "customer-local"));
     let service = MeterLayer::new(EdgeConfig::new(tenants)).layer(service_fn(
         |_request: Request<Full<Bytes>>| async move {
             let body = Bytes::from_static(

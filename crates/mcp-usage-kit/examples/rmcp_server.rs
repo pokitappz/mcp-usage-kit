@@ -68,14 +68,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let tenants = Arc::new(InMemoryTenantStore::new());
+    // The validating insert, because this key came from outside the program.
+    // Keys are looked up by digest, which only protects a secret that was hard
+    // to guess to begin with. Generate one with `openssl rand -base64 32`.
     tenants.insert(
         &api_key,
         Tenant::new("development", "cus_replace_me")
             .with_prices(PriceBook::flat(1).with_name("add", 2)),
-    );
+    )?;
 
     let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
     let edge = EdgeConfig::new(tenants).with_recorder(billing.clone());
+    // Terminal accounting that could not finish without awaiting is parked here.
+    // Only a durable task store parks anything, but taking the handle costs
+    // nothing and means swapping in Redis or PostgreSQL later needs no other
+    // change to this file.
+    let deferred = edge.deferred();
     let cancellation = CancellationToken::new();
     let rmcp = StreamableHttpService::<Calculator, LocalSessionManager>::new(
         || Ok(Calculator::new()),
@@ -93,17 +101,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flush = tokio::spawn({
         let billing = billing.clone();
         let cancellation = cancellation.clone();
+        let deferred = deferred.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        deferred.drain().await;
                         if let Err(error) = billing.flush().await {
                             eprintln!("billing flush failed; retained for retry: {error}");
                         }
                     }
                     () = cancellation.cancelled() => break,
                 }
+            }
+            // Drain once more on the way out, so a departing process does not
+            // take durable-task charges with it.
+            deferred.drain().await;
+            if let Err(error) = billing.flush().await {
+                eprintln!("final billing flush failed: {error}");
             }
         }
     });

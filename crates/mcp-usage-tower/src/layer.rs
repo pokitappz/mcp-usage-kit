@@ -19,9 +19,10 @@ use mcp_usage_export::{NoopRecorder, RecordOutcome, SharedRecorder, UsageEvent};
 use serde_json::{Value, json};
 use tower::{Layer, Service};
 
-use crate::auth::{Tenant, TenantStore, hash_api_key};
+use crate::auth::{AuthFailureLimit, Tenant, TenantStore, hash_api_key};
 use crate::cache::{CachedResponse, RequestMetadata, ResponseCache, cache_hints, inspect_request};
 use crate::classify::classify_protocol_headers;
+use crate::deferred::DeferredCompletions;
 use crate::metrics::EdgeMetrics;
 use crate::task::{InMemoryTaskStore, TaskAttributionStore};
 use crate::{METHOD_HEADER, NAME_HEADER, PROTOCOL_VERSION_HEADER};
@@ -33,6 +34,14 @@ pub type MeterBody = UnsyncBoxBody<Bytes, BoxError>;
 
 const DEFAULT_CACHE_ENTRIES: usize = 512;
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Terminal accounting parked for want of somewhere to await.
+const DEFAULT_DEFERRED_CAPACITY: usize = 4_096;
+/// Parked completions run at the start of each request.
+///
+/// Small on purpose. This borrows the request path to make progress, so it has
+/// to stay cheap; an application under load has no shortage of requests to
+/// amortize the backlog across.
+const DEFAULT_DEFERRED_DRAIN_PER_REQUEST: usize = 2;
 
 /// Runtime configuration shared by every cloned metering service.
 #[derive(Clone)]
@@ -49,6 +58,9 @@ pub struct EdgeConfig {
     cache_max_ttl: Duration,
     share_public_cache: bool,
     forward_credentials: bool,
+    deferred: Arc<DeferredCompletions>,
+    deferred_drain_per_request: usize,
+    auth_failure_limit: Option<Arc<AuthFailureLimit>>,
 }
 
 impl std::fmt::Debug for EdgeConfig {
@@ -59,6 +71,7 @@ impl std::fmt::Debug for EdgeConfig {
             .field("max_response_capture", &self.max_response_capture)
             .field("share_public_cache", &self.share_public_cache)
             .field("forward_credentials", &self.forward_credentials)
+            .field("deferred_pending", &self.deferred.len())
             .finish_non_exhaustive()
     }
 }
@@ -84,6 +97,9 @@ impl EdgeConfig {
             cache_max_ttl: DEFAULT_CACHE_TTL,
             share_public_cache: false,
             forward_credentials: false,
+            deferred: Arc::new(DeferredCompletions::new(DEFAULT_DEFERRED_CAPACITY)),
+            deferred_drain_per_request: DEFAULT_DEFERRED_DRAIN_PER_REQUEST,
+            auth_failure_limit: None,
         }
     }
 
@@ -184,6 +200,55 @@ impl EdgeConfig {
     pub fn metrics(&self) -> Arc<EdgeMetrics> {
         self.metrics.clone()
     }
+
+    /// Terminal accounting parked because it could not finish without awaiting.
+    ///
+    /// Only a durable task store parks anything: its futures perform real I/O,
+    /// and the body is released from `Drop`, where nothing may await. Every
+    /// subsequent request runs a bounded number of them, so an application that
+    /// ignores this still converges. Draining explicitly is better, and draining
+    /// on shutdown is what stops a departing process from taking durable-task
+    /// charges with it.
+    ///
+    /// Take the handle before passing the configuration to the layer.
+    #[must_use]
+    pub fn deferred(&self) -> Arc<DeferredCompletions> {
+        self.deferred.clone()
+    }
+
+    /// Bound how much parked accounting each request runs.
+    ///
+    /// Zero leaves draining entirely to [`EdgeConfig::deferred`]. Raising it
+    /// clears a backlog sooner at the cost of latency on the requests that do
+    /// the work.
+    #[must_use]
+    pub fn with_deferred_drain_per_request(mut self, completions: usize) -> Self {
+        self.deferred_drain_per_request = completions;
+        self
+    }
+
+    /// Bound how many completions may be parked before the oldest is discarded.
+    #[must_use]
+    pub fn with_deferred_capacity(mut self, capacity: usize) -> Self {
+        self.deferred = Arc::new(DeferredCompletions::new(capacity));
+        self
+    }
+
+    /// Refuse further guessing after `max_failures` bad credentials in `window`.
+    ///
+    /// Disabled by default, because the useful ceiling depends entirely on how
+    /// many clients an edge serves. Only failures consume the budget, so a
+    /// caller with a valid key is never affected: exhausting it turns a wrong
+    /// key's `401` into a `429` and nothing more.
+    ///
+    /// This bounds sustained guessing across the whole edge. It is not
+    /// per-client limiting, which needs a client identity this layer cannot
+    /// trust, and belongs in the proxy in front of it.
+    #[must_use]
+    pub fn with_auth_failure_limit(mut self, max_failures: u64, window: Duration) -> Self {
+        self.auth_failure_limit = Some(Arc::new(AuthFailureLimit::new(max_failures, window)));
+        self
+    }
 }
 
 /// Tower layer that installs [`MeterService`].
@@ -247,6 +312,16 @@ where
         let config = self.config.clone();
 
         Box::pin(async move {
+            // Borrow this request to make progress on accounting a previous one
+            // could not finish. Bounded, so a backlog is amortized across
+            // traffic rather than charged to whichever request finds it.
+            if config.deferred_drain_per_request > 0 {
+                config
+                    .deferred
+                    .drain_some(config.deferred_drain_per_request)
+                    .await;
+            }
+
             let (mut parts, request_body) = request.into_parts();
             let protocol = match classify_request_headers(&parts.headers) {
                 Ok(protocol) => protocol,
@@ -262,25 +337,15 @@ where
             let api_key = match extract_api_key(&parts.headers) {
                 Ok(api_key) => api_key,
                 Err(error) => {
-                    config.metrics.unauthenticated();
                     let message = match error {
                         CredentialError::Missing => "missing API key",
                         CredentialError::Invalid => "invalid or ambiguous API key headers",
                     };
-                    return Ok(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "UNAUTHENTICATED",
-                        message,
-                    ));
+                    return Ok(refuse_credential(&config, message));
                 }
             };
             let Some(tenant) = config.tenants.authenticate(api_key) else {
-                config.metrics.unauthenticated();
-                return Ok(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "UNAUTHENTICATED",
-                    "invalid API key",
-                ));
+                return Ok(refuse_credential(&config, "invalid API key"));
             };
             let authorization_context = hash_api_key(api_key);
             config.metrics.classified();
@@ -437,6 +502,28 @@ fn extract_api_key(headers: &HeaderMap) -> Result<&str, CredentialError> {
         return Err(CredentialError::Invalid);
     }
     Ok(value)
+}
+
+/// Refuse a request whose credential did not authenticate.
+///
+/// The failure budget is consulted only here, on the path a caller reaches by
+/// presenting a credential that did not work. A valid key never passes through
+/// this function, which is what makes a global budget safe: guessing cannot
+/// throttle callers who are not guessing.
+fn refuse_credential(config: &EdgeConfig, message: &str) -> Response<MeterBody> {
+    if let Some(limit) = config.auth_failure_limit.as_ref() {
+        if limit.is_exhausted() {
+            config.metrics.throttled();
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_FAILED_CREDENTIALS",
+                "too many failed authentication attempts",
+            );
+        }
+        limit.record_failure();
+    }
+    config.metrics.unauthenticated();
+    error_response(StatusCode::UNAUTHORIZED, "UNAUTHENTICATED", message)
 }
 
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response<MeterBody> {
@@ -647,11 +734,13 @@ struct ObservedBody<B> {
     captured: BytesMut,
     overflowed: bool,
     metrics: Arc<EdgeMetrics>,
+    deferred: Arc<DeferredCompletions>,
 }
 
 impl<B> ObservedBody<B> {
     fn new(inner: B, completion: Completion) -> Self {
         let metrics = completion.config.metrics.clone();
+        let deferred = completion.config.deferred.clone();
         Self {
             inner: Box::pin(inner),
             completion: Some(completion),
@@ -659,6 +748,7 @@ impl<B> ObservedBody<B> {
             captured: BytesMut::new(),
             overflowed: false,
             metrics,
+            deferred,
         }
     }
 
@@ -688,21 +778,36 @@ impl<B> Drop for ObservedBody<B> {
     /// transport does give us.
     ///
     /// Nothing here may await, so the future is polled once with a no-op waker.
-    /// That is sufficient for every synchronous recorder and for the default
-    /// in-memory task store, whose futures never yield. A store that performs
-    /// real I/O may still be pending, which is counted as a record failure
-    /// rather than passed over in silence.
+    /// That settles it outright for every synchronous recorder and for the
+    /// in-process task store, whose futures never yield.
+    ///
+    /// A durable store performs real I/O, so its first poll pends. That work is
+    /// parked on [`DeferredCompletions`] to be driven from somewhere that can
+    /// await, because the paths that pend are the ones carrying durable-task
+    /// attribution: abandoning them loses the charge for every durable task.
     fn drop(&mut self) {
         let mut context = Context::from_waker(std::task::Waker::noop());
-        let abandoned = if let Some(finishing) = self.finishing.as_mut() {
-            finishing.as_mut().poll(&mut context).is_pending()
+        let unfinished = if let Some(mut finishing) = self.finishing.take() {
+            finishing
+                .as_mut()
+                .poll(&mut context)
+                .is_pending()
+                .then_some(finishing)
         } else if let Some(mut finishing) = self.start_completion() {
-            finishing.as_mut().poll(&mut context).is_pending()
+            finishing
+                .as_mut()
+                .poll(&mut context)
+                .is_pending()
+                .then_some(finishing)
         } else {
-            false
+            None
         };
-        if abandoned {
-            self.metrics.record_failure();
+        if let Some(finishing) = unfinished {
+            self.metrics.deferred();
+            if !self.deferred.park(finishing) {
+                // The queue was full, so the oldest accounting was discarded.
+                self.metrics.record_failure();
+            }
         }
     }
 }
@@ -770,7 +875,7 @@ where
     }
 }
 
-fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Value> {
+pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Value> {
     if has_media_type(content_type, "application/json") {
         return serde_json::from_slice(bytes).ok();
     }
@@ -835,6 +940,12 @@ where
     Ok(captured.freeze())
 }
 
+/// Internals reachable from the crate's property tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    pub(crate) use super::terminal_response;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,10 +987,248 @@ mod tests {
         response.into_body().collect().await.unwrap().to_bytes()
     }
 
+    /// Release a body the way a transport does once `Content-Length` is met:
+    /// take the data, then drop without ever polling to end-of-stream.
+    fn release_without_end_of_stream(response: Response<MeterBody>) {
+        let mut body = Box::pin(response.into_body());
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let _ = body.as_mut().poll_frame(&mut context);
+        drop(body);
+    }
+
+    /// A future that pends exactly once, the way a store doing I/O behaves.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A task store that yields before answering, standing in for Redis or
+    /// `PostgreSQL` without requiring either to be running.
+    #[derive(Debug, Default)]
+    struct YieldingTaskStore(InMemoryTaskStore);
+
+    impl TaskAttributionStore for YieldingTaskStore {
+        fn insert<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            task_id: &'a str,
+            call: Call,
+        ) -> crate::TaskStoreFuture<'a, ()> {
+            Box::pin(async move {
+                YieldOnce(false).await;
+                self.0.insert(tenant_id, task_id, call).await
+            })
+        }
+        fn get<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            task_id: &'a str,
+        ) -> crate::TaskStoreFuture<'a, Option<Call>> {
+            Box::pin(async move {
+                YieldOnce(false).await;
+                self.0.get(tenant_id, task_id).await
+            })
+        }
+        fn claim<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            task_id: &'a str,
+        ) -> crate::TaskStoreFuture<'a, Option<Call>> {
+            Box::pin(async move {
+                YieldOnce(false).await;
+                self.0.claim(tenant_id, task_id).await
+            })
+        }
+        fn remove<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            task_id: &'a str,
+        ) -> crate::TaskStoreFuture<'a, ()> {
+            Box::pin(async move {
+                YieldOnce(false).await;
+                self.0.remove(tenant_id, task_id).await
+            })
+        }
+    }
+
+    /// Drive a `tools/call` that creates a task, then a `tasks/get` that reports
+    /// it completed, releasing both bodies the way a real transport does.
+    async fn run_task_lifecycle<S>(service: S)
+    where
+        S: tower::Service<Request<Full<Bytes>>, Response = Response<MeterBody>, Error = Infallible>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send,
+    {
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/call",
+                    Some("long_job"),
+                    &json!({"id":1,"params":{"name":"long_job"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        release_without_end_of_stream(
+            service
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":2,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+    }
+
+    fn task_lifecycle_service(
+        config: EdgeConfig,
+    ) -> impl tower::Service<
+        Request<Full<Bytes>>,
+        Response = Response<MeterBody>,
+        Error = Infallible,
+        Future = impl Send,
+    > + Clone
+    + Send
+    + 'static {
+        let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(move |_request: Request<Full<Bytes>>| {
+                let n = stage.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    let result = if n == 0 {
+                        json!({"resultType":"task","taskId":"task-1","status":"working"})
+                    } else {
+                        json!({"resultType":"complete","taskId":"task-1","status":"completed","result":{}})
+                    };
+                    Ok::<_, Infallible>(response(&json!({"jsonrpc":"2.0","id":n,"result":result})))
+                }
+            }))
+    }
+
+    fn task_tenants() -> Arc<InMemoryTenantStore> {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme")
+                .with_prices(PriceBook::flat(1).with_name("long_job", 50)),
+        );
+        tenants
+    }
+
+    #[tokio::test]
+    async fn a_store_that_yields_is_parked_rather_than_abandoned() {
+        // A durable store performs I/O, so its future pends on the single poll
+        // `Drop` can give it. Before this was parked, every durable-task charge
+        // was lost: the attribution insert never landed, so the completing poll
+        // had nothing to price.
+        let config = EdgeConfig::new(task_tenants())
+            .with_task_store(Arc::new(YieldingTaskStore::default()))
+            .with_deferred_drain_per_request(0);
+        let metrics = config.metrics();
+        let deferred = config.deferred();
+
+        run_task_lifecycle(task_lifecycle_service(config)).await;
+
+        assert_eq!(
+            metrics.snapshot().billed,
+            0,
+            "nothing can be billed while the store has not answered"
+        );
+        assert!(
+            !deferred.is_empty(),
+            "the unfinished accounting must be parked"
+        );
+        assert_eq!(deferred.dropped(), 0);
+
+        // Draining is the context that can await, so this is where it lands.
+        assert!(deferred.drain().await > 0);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 1, "the completed task must be charged");
+        assert_eq!(
+            snapshot.billed_units, 50,
+            "priced from the originating call"
+        );
+        assert_eq!(snapshot.record_failures, 0);
+        assert!(deferred.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_later_request_drains_parked_accounting_on_its_own() {
+        // An application that never calls `drain` must still converge, so every
+        // request runs a bounded amount of parked work.
+        let config =
+            EdgeConfig::new(task_tenants()).with_task_store(Arc::new(YieldingTaskStore::default()));
+        let metrics = config.metrics();
+        let deferred = config.deferred();
+        let service = task_lifecycle_service(config);
+
+        run_task_lifecycle(service.clone()).await;
+        assert_eq!(metrics.snapshot().billed, 0);
+
+        // Ordinary unrelated traffic, with no drain call anywhere.
+        for id in 3..8 {
+            release_without_end_of_stream(
+                service
+                    .clone()
+                    .oneshot(request(
+                        "tools/list",
+                        None,
+                        &json!({"id":id,"params":{}}),
+                        "secret",
+                    ))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            metrics.snapshot().billed,
+            1,
+            "subsequent requests must complete the parked accounting"
+        );
+        assert_eq!(metrics.snapshot().billed_units, 50);
+        assert!(deferred.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_synchronous_store_never_parks_anything() {
+        // The default in-process store answers without yielding, so the common
+        // deployment must not pay for the queue at all.
+        let config = EdgeConfig::new(task_tenants());
+        let metrics = config.metrics();
+        let deferred = config.deferred();
+
+        run_task_lifecycle(task_lifecycle_service(config)).await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 1);
+        assert_eq!(snapshot.billed_units, 50);
+        assert_eq!(snapshot.deferred, 0, "nothing should have been parked");
+        assert!(deferred.is_empty());
+    }
+
     #[tokio::test]
     async fn complete_tool_call_is_recorded_after_body_consumption() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("expensive", 25)),
@@ -914,10 +1263,10 @@ mod tests {
     #[tokio::test]
     async fn private_cache_never_crosses_authorization_contexts_and_rewrites_response_id() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("key-a", Tenant::new("a", "cus_a"));
+        tenants.insert_unchecked("key-a", Tenant::new("a", "cus_a"));
         // Even two credentials mapped to the same tenant are distinct
         // authorization contexts for private-cache purposes.
-        tenants.insert("key-b", Tenant::new("a", "cus_a"));
+        tenants.insert_unchecked("key-b", Tenant::new("a", "cus_a"));
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_calls = calls.clone();
         let config = EdgeConfig::new(tenants);
@@ -975,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn cache_hits_for_billable_resources_are_still_metered_on_delivery() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("file:///report", 4)),
@@ -1025,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn trace_context_reaches_the_rmcp_service_unchanged() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let inner_seen = seen.clone();
         let service = ServiceBuilder::new()
@@ -1062,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn task_completion_uses_origin_price_and_repeat_poll_is_free() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("long_job", 50)),
@@ -1123,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_task_response_cannot_bill_another_tasks_origin() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme")
                 .with_prices(PriceBook::flat(1).with_name("expensive", 100)),
@@ -1194,7 +1543,7 @@ mod tests {
         // `BodyExt::collect`, which always polls to `None` and would hide the
         // regression this test exists to catch.
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("tool", 7)),
         );
@@ -1254,7 +1603,7 @@ mod tests {
         // The guard against the Drop path double-counting what `poll_frame`
         // already recorded.
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert(
+        tenants.insert_unchecked(
             "secret",
             Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(1).with_name("tool", 5)),
         );
@@ -1295,8 +1644,8 @@ mod tests {
         // means it was served tenant A's cached body.
         for (share, expected_origin_calls) in [(false, 2), (true, 1)] {
             let tenants = Arc::new(InMemoryTenantStore::new());
-            tenants.insert("key-a", Tenant::new("a", "cus_a"));
-            tenants.insert("key-b", Tenant::new("b", "cus_b"));
+            tenants.insert_unchecked("key-a", Tenant::new("a", "cus_a"));
+            tenants.insert_unchecked("key-b", Tenant::new("b", "cus_b"));
             let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let inner_calls = calls.clone();
             let service = ServiceBuilder::new()
@@ -1343,7 +1692,7 @@ mod tests {
     #[tokio::test]
     async fn the_consumed_credential_does_not_reach_the_inner_service() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
 
         for (forward, expected) in [(false, false), (true, true)] {
             for bearer in [false, true] {
@@ -1395,7 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn generated_responses_pin_their_content_type_and_stay_out_of_shared_caches() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("key-a", Tenant::new("a", "cus_a"));
+        tenants.insert_unchecked("key-a", Tenant::new("a", "cus_a"));
         let service = ServiceBuilder::new()
             .layer(MeterLayer::new(EdgeConfig::new(tenants)))
             .service(service_fn(|_request: Request<Full<Bytes>>| async {
@@ -1445,9 +1794,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sustained_guessing_is_refused_without_affecting_valid_keys() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let config =
+            EdgeConfig::new(tenants).with_auth_failure_limit(3, std::time::Duration::from_secs(60));
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                })))
+            }));
+
+        let guess = |key: &'static str| {
+            let service = service.clone();
+            async move {
+                service
+                    .oneshot(request(
+                        "tools/list",
+                        None,
+                        &json!({"id":1,"params":{}}),
+                        key,
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        for _ in 0..3 {
+            assert_eq!(guess("wrong").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            guess("wrong").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "sustained guessing must stop being answered"
+        );
+
+        // A valid key never consumed the budget, so it is still served.
+        let allowed = service
+            .clone()
+            .oneshot(request(
+                "tools/list",
+                None,
+                &json!({"id":9,"params":{}}),
+                "secret",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.status(),
+            StatusCode::OK,
+            "throttling guessers must not lock out legitimate callers"
+        );
+        consume(allowed).await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.unauthenticated, 3);
+        assert_eq!(snapshot.throttled, 1);
+    }
+
+    #[tokio::test]
     async fn credential_failures_are_counted_apart_from_header_failures() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
         let config = EdgeConfig::new(tenants);
         let metrics = config.metrics();
         let service = ServiceBuilder::new()
@@ -1507,7 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_request_bodies_are_rejected_before_the_origin() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_calls = calls.clone();
         let service = ServiceBuilder::new()
@@ -1535,7 +1947,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_or_duplicate_security_headers_are_rejected() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
         let service = ServiceBuilder::new()
             .layer(MeterLayer::new(EdgeConfig::new(tenants)))
             .service(service_fn(|_request: Request<Full<Bytes>>| async {
@@ -1565,7 +1977,7 @@ mod tests {
     #[tokio::test]
     async fn a_header_body_mismatch_cannot_use_the_cache() {
         let tenants = Arc::new(InMemoryTenantStore::new());
-        tenants.insert("secret", Tenant::new("acme", "cus_acme"));
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let inner_calls = calls.clone();
         let service = ServiceBuilder::new()

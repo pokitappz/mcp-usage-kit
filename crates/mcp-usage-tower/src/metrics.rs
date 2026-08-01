@@ -8,6 +8,7 @@ pub struct EdgeMetrics {
     classified: AtomicU64,
     rejected: AtomicU64,
     unauthenticated: AtomicU64,
+    throttled: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     billed: AtomicU64,
@@ -15,6 +16,7 @@ pub struct EdgeMetrics {
     free: AtomicU64,
     duplicates: AtomicU64,
     record_failures: AtomicU64,
+    deferred: AtomicU64,
     unrecognized_responses: AtomicU64,
 }
 
@@ -29,6 +31,8 @@ pub struct MetricsSnapshot {
     /// apart from `rejected` so credential stuffing is distinguishable from
     /// clients that simply send bad protocol headers.
     pub unauthenticated: u64,
+    /// Requests refused because the authentication-failure budget was spent.
+    pub throttled: u64,
     /// Responses served from cache.
     pub cache_hits: u64,
     /// Cacheable requests not served from cache.
@@ -43,6 +47,9 @@ pub struct MetricsSnapshot {
     pub duplicates: u64,
     /// Local recorder failures.
     pub record_failures: u64,
+    /// Terminal accounting parked because it could not finish without awaiting.
+    /// Only a durable task store produces these.
+    pub deferred: u64,
     /// Bodies that ended without a parseable terminal response.
     pub unrecognized_responses: u64,
 }
@@ -56,6 +63,9 @@ impl EdgeMetrics {
     }
     pub(crate) fn unauthenticated(&self) {
         saturating_add(&self.unauthenticated, 1);
+    }
+    pub(crate) fn throttled(&self) {
+        saturating_add(&self.throttled, 1);
     }
     pub(crate) fn cache_hit(&self) {
         saturating_add(&self.cache_hits, 1);
@@ -76,6 +86,9 @@ impl EdgeMetrics {
     pub(crate) fn record_failure(&self) {
         saturating_add(&self.record_failures, 1);
     }
+    pub(crate) fn deferred(&self) {
+        saturating_add(&self.deferred, 1);
+    }
     pub(crate) fn unrecognized_response(&self) {
         saturating_add(&self.unrecognized_responses, 1);
     }
@@ -87,6 +100,7 @@ impl EdgeMetrics {
             classified: self.classified.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             unauthenticated: self.unauthenticated.load(Ordering::Relaxed),
+            throttled: self.throttled.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             billed: self.billed.load(Ordering::Relaxed),
@@ -94,6 +108,7 @@ impl EdgeMetrics {
             free: self.free.load(Ordering::Relaxed),
             duplicates: self.duplicates.load(Ordering::Relaxed),
             record_failures: self.record_failures.load(Ordering::Relaxed),
+            deferred: self.deferred.load(Ordering::Relaxed),
             unrecognized_responses: self.unrecognized_responses.load(Ordering::Relaxed),
         }
     }
@@ -130,6 +145,12 @@ impl MetricsSnapshot {
             "mcp_usage_unauthenticated_total",
             "MCP requests refused for a missing, malformed, or unknown API key.",
             self.unauthenticated,
+        );
+        append_metric(
+            &mut output,
+            "mcp_usage_throttled_total",
+            "MCP requests refused after too many failed authentication attempts.",
+            self.throttled,
         );
         append_metric(
             &mut output,
@@ -172,6 +193,12 @@ impl MetricsSnapshot {
             "mcp_usage_record_failures_total",
             "Local recorder or attribution-store failures.",
             self.record_failures,
+        );
+        append_metric(
+            &mut output,
+            "mcp_usage_deferred_completions_total",
+            "Terminal accounting parked to be completed outside the response body.",
+            self.deferred,
         );
         append_metric(
             &mut output,
