@@ -1,8 +1,7 @@
 CREATE TABLE IF NOT EXISTS mcp_usage_task_attribution (
     tenant_hash BYTEA NOT NULL,
     task_hash BYTEA NOT NULL,
-    method TEXT NOT NULL,
-    name TEXT,
+    attribution BYTEA NOT NULL CHECK (octet_length(attribution) = 10),
     expires_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_hash, task_hash)
 );

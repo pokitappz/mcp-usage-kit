@@ -14,7 +14,9 @@ use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::{Body, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
-use mcp_usage_core::{Call, Charge, Method, ResultType, TaskStatus, decide_with_task_origin};
+use mcp_usage_core::{
+    Call, Charge, Method, ResultType, TaskAttribution, TaskStatus, decide_with_task_attribution,
+};
 use mcp_usage_export::{NoopRecorder, RecordOutcome, SharedRecorder, UsageEvent};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -650,7 +652,11 @@ impl Completion {
             && let Err(error) = self
                 .config
                 .tasks
-                .insert(&self.tenant.id, task_id, self.call.clone())
+                .insert(
+                    &self.tenant.id,
+                    task_id,
+                    TaskAttribution::from_call(&self.call, &self.tenant.prices),
+                )
                 .await
         {
             self.config.metrics.record_failure();
@@ -684,7 +690,7 @@ impl Completion {
         } else {
             None
         };
-        let charge = decide_with_task_origin(
+        let charge = decide_with_task_attribution(
             &self.call,
             &response,
             &self.tenant.prices,
@@ -1119,18 +1125,18 @@ mod tests {
             &'a self,
             tenant_id: &'a str,
             task_id: &'a str,
-            call: Call,
+            attribution: TaskAttribution,
         ) -> crate::TaskStoreFuture<'a, ()> {
             Box::pin(async move {
                 YieldOnce(false).await;
-                self.0.insert(tenant_id, task_id, call).await
+                self.0.insert(tenant_id, task_id, attribution).await
             })
         }
         fn get<'a>(
             &'a self,
             tenant_id: &'a str,
             task_id: &'a str,
-        ) -> crate::TaskStoreFuture<'a, Option<Call>> {
+        ) -> crate::TaskStoreFuture<'a, Option<TaskAttribution>> {
             Box::pin(async move {
                 YieldOnce(false).await;
                 self.0.get(tenant_id, task_id).await
@@ -1140,7 +1146,7 @@ mod tests {
             &'a self,
             tenant_id: &'a str,
             task_id: &'a str,
-        ) -> crate::TaskStoreFuture<'a, Option<Call>> {
+        ) -> crate::TaskStoreFuture<'a, Option<TaskAttribution>> {
             Box::pin(async move {
                 YieldOnce(false).await;
                 self.0.claim(tenant_id, task_id).await

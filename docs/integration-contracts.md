@@ -11,12 +11,15 @@ major version or wire format.
   it reconnects after transient failures.
 - Timeouts: connection and command operations default to two seconds and can be
   configured with `RedisTaskStore::connect_with_timeout`.
-- Writes: `SET key value NX EX seconds` preserves the first task origin and
-  expires abandoned tasks. TTLs are validated as positive signed 64-bit seconds
-  before the client parses a URL or opens a connection, matching Redis integer
-  expiry arguments.
-- Claims: a single `EVAL` operation reads and deletes the task origin atomically.
-- Privacy: keys contain SHA-256 digests of tenant and task IDs, never plaintext.
+- Writes: `SET key value NX EX seconds` preserves the first pre-priced task
+  attribution and expires abandoned tasks. TTLs are validated as positive
+  signed 64-bit seconds before the client parses a URL or opens a connection,
+  matching Redis integer expiry arguments.
+- Claims: a single `EVAL` operation reads and deletes the attribution atomically.
+- Privacy: keys contain SHA-256 digests of tenant and task IDs. Values use a
+  versioned 10-byte record containing only a fixed method category and the
+  resolved unsigned integer price. No identifier, name, URI, or extension
+  method text is persisted.
 - References: [Redis `SET`](https://redis.io/docs/latest/commands/set/),
   [Redis signed integer representation](https://redis.io/docs/latest/develop/reference/protocol-spec/),
   [Redis Rust client guidance](https://redis.io/docs/latest/develop/clients/rust/json/),
@@ -31,8 +34,15 @@ major version or wire format.
   configuration value is interpolated into SQL.
 - Timeouts: every schema and query operation defaults to two seconds and can be
   configured with `PostgresTaskStore::with_timeout`.
-- Claims: `DELETE ... RETURNING` atomically consumes one completed task origin.
+- Claims: `DELETE ... RETURNING` atomically consumes one completed task
+  attribution.
 - Schema: [`crates/mcp-usage-store/schema/postgres.sql`](../crates/mcp-usage-store/schema/postgres.sql).
+- Privacy: the schema stores hashed tenant and task IDs plus the same versioned
+  10-byte attribution used by Redis. It has no method-text or name column.
+- Pre-release schema change: installations created from an earlier commit must
+  reconcile or expire live task records, then drop and reinstall
+  `mcp_usage_task_attribution`. `PostgresTaskStore::install` rejects the old
+  shape instead of silently using it.
 - References: [SQLx 0.8.6](https://docs.rs/sqlx/0.8.6/sqlx/),
   [SQLx pooling](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html).
 

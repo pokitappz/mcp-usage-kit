@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use mcp_usage_core::Call;
+use mcp_usage_core::TaskAttribution;
 use thiserror::Error;
 
 /// Boxed future returned by object-safe task stores.
@@ -23,18 +23,21 @@ pub enum TaskStoreError {
     InvalidRecord,
 }
 
-/// Persists the original priced call under a durable task ID.
+/// Persists pre-priced, non-identifying attribution under a durable task ID.
 pub trait TaskAttributionStore: Send + Sync {
-    /// Associate a task with the call that created it.
+    /// Associate a task with its resolved price and fixed origin category.
     fn insert<'a>(
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-        call: Call,
+        attribution: TaskAttribution,
     ) -> TaskStoreFuture<'a, ()>;
     /// Resolve an association without consuming it.
-    fn get<'a>(&'a self, tenant_id: &'a str, task_id: &'a str)
-    -> TaskStoreFuture<'a, Option<Call>>;
+    fn get<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        task_id: &'a str,
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>>;
     /// Atomically consume and return an association.
     ///
     /// A completed durable task can be returned by many later polls. Using this
@@ -44,7 +47,7 @@ pub trait TaskAttributionStore: Send + Sync {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>>;
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>>;
     /// Remove an association after a terminal task is accounted for.
     fn remove<'a>(&'a self, tenant_id: &'a str, task_id: &'a str) -> TaskStoreFuture<'a, ()>;
 }
@@ -60,7 +63,7 @@ struct TaskState {
 
 #[derive(Debug)]
 struct TaskEntry {
-    call: Call,
+    attribution: TaskAttribution,
     generation: u128,
 }
 
@@ -141,7 +144,7 @@ impl TaskAttributionStore for InMemoryTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-        call: Call,
+        attribution: TaskAttribution,
     ) -> TaskStoreFuture<'a, ()> {
         Box::pin(async move {
             if self.max_tasks == 0 {
@@ -173,7 +176,13 @@ impl TaskAttributionStore for InMemoryTaskStore {
             let generation = state.next_generation;
             state.next_generation = state.next_generation.wrapping_add(1);
             state.insertion_order.push_back((key.clone(), generation));
-            state.tasks.insert(key, TaskEntry { call, generation });
+            state.tasks.insert(
+                key,
+                TaskEntry {
+                    attribution,
+                    generation,
+                },
+            );
             Ok(())
         })
     }
@@ -182,7 +191,7 @@ impl TaskAttributionStore for InMemoryTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
             Ok(self
                 .state
@@ -190,7 +199,7 @@ impl TaskAttributionStore for InMemoryTaskStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .tasks
                 .get(&(tenant_id.to_owned(), task_id.to_owned()))
-                .map(|entry| entry.call.clone()))
+                .map(|entry| entry.attribution))
         })
     }
 
@@ -198,14 +207,14 @@ impl TaskAttributionStore for InMemoryTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
             let key = (tenant_id.to_owned(), task_id.to_owned());
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let claimed = state.tasks.remove(&key).map(|entry| entry.call);
+            let claimed = state.tasks.remove(&key).map(|entry| entry.attribution);
             if claimed.is_some() {
                 self.compact_order_if_needed(&mut state);
             }
@@ -230,47 +239,53 @@ impl TaskAttributionStore for InMemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_usage_core::Method;
+    use mcp_usage_core::TaskOriginKind;
 
-    fn call(name: &str) -> Call {
-        Call::new(Method::ToolsCall, Some(name.to_owned()))
+    const fn attribution(units: u64) -> TaskAttribution {
+        TaskAttribution::new(TaskOriginKind::ToolsCall, units)
     }
 
     #[tokio::test]
     async fn capacity_is_bounded_and_task_origins_cannot_be_replaced() {
         let store = InMemoryTaskStore::with_capacity(2);
-        store.insert("tenant", "one", call("first")).await.unwrap();
         store
-            .insert("tenant", "one", call("replacement"))
+            .insert("tenant", "one", attribution(10))
             .await
             .unwrap();
+        store.insert("tenant", "one", attribution(1)).await.unwrap();
         assert_eq!(
             store.get("tenant", "one").await.unwrap(),
-            Some(call("first"))
+            Some(attribution(10))
         );
 
-        store.insert("tenant", "two", call("second")).await.unwrap();
         store
-            .insert("tenant", "three", call("third"))
+            .insert("tenant", "two", attribution(20))
+            .await
+            .unwrap();
+        store
+            .insert("tenant", "three", attribution(30))
             .await
             .unwrap();
         assert_eq!(store.len(), 2);
         assert!(store.get("tenant", "one").await.unwrap().is_none());
         assert_eq!(
             store.claim("tenant", "two").await.unwrap(),
-            Some(call("second"))
+            Some(attribution(20))
         );
         assert!(store.claim("tenant", "two").await.unwrap().is_none());
         assert_eq!(
             store.get("tenant", "three").await.unwrap(),
-            Some(call("third"))
+            Some(attribution(30))
         );
     }
 
     #[tokio::test]
     async fn zero_capacity_disables_storage() {
         let store = InMemoryTaskStore::with_capacity(0);
-        store.insert("tenant", "task", call("tool")).await.unwrap();
+        store
+            .insert("tenant", "task", attribution(1))
+            .await
+            .unwrap();
         assert!(store.is_empty());
     }
 
@@ -281,7 +296,7 @@ mod tests {
         for index in 0..100 {
             let task_id = format!("task-{index}");
             store
-                .insert("tenant", &task_id, call("tool"))
+                .insert("tenant", &task_id, attribution(1))
                 .await
                 .unwrap();
             assert!(store.claim("tenant", &task_id).await.unwrap().is_some());

@@ -55,6 +55,10 @@ the application that embeds them.
   This keeps plaintext identifiers out of backend key names but does not prevent
   dictionary recovery of low-entropy values. A keyed-hash migration requires a
   coordinated key-format rollout and is not part of the current API.
+- **Task-attribution payloads.** The edge resolves named pricing when a durable
+  task is created. Stores retain only the unsigned integer price and a fixed
+  method category. Tool names, prompt names, resource URIs, and extension method
+  strings are never written to Redis, Valkey, or PostgreSQL.
 
 ## Reporting a vulnerability
 
