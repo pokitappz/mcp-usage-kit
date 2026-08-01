@@ -1,11 +1,11 @@
 use std::time::Duration;
 use std::{future::Future, result::Result as StdResult};
 
-use mcp_usage_core::{Call, Method};
+use mcp_usage_core::TaskAttribution;
 use mcp_usage_tower::{TaskAttributionStore, TaskStoreError, TaskStoreFuture};
 use sqlx::PgPool;
 
-use crate::{StoreConfigError, identifier_hash};
+use crate::{StoreConfigError, decode_attribution, encode_attribution, identifier_hash};
 
 /// Schema installation, serialized by a transaction-scoped advisory lock.
 ///
@@ -24,7 +24,8 @@ use crate::{StoreConfigError, identifier_hash};
 /// takes on the same database.
 const INSTALL_SQL: &str = concat!(
     "SELECT pg_advisory_xact_lock(7594834021775991);\n",
-    include_str!("../schema/postgres.sql")
+    include_str!("../schema/postgres.sql"),
+    "\nSELECT attribution FROM mcp_usage_task_attribution LIMIT 0;"
 );
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -138,20 +139,19 @@ impl TaskAttributionStore for PostgresTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-        call: Call,
+        attribution: TaskAttribution,
     ) -> TaskStoreFuture<'a, ()> {
         Box::pin(async move {
             self.run(
                 sqlx::query(
                     "INSERT INTO mcp_usage_task_attribution \
-                 (tenant_hash, task_hash, method, name, expires_at) \
-                 VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second')) \
+                 (tenant_hash, task_hash, attribution, expires_at) \
+                 VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 second')) \
                  ON CONFLICT (tenant_hash, task_hash) DO NOTHING",
                 )
                 .bind(identifier_hash(tenant_id).to_vec())
                 .bind(identifier_hash(task_id).to_vec())
-                .bind(call.method.as_str())
-                .bind(call.name)
+                .bind(encode_attribution(attribution).to_vec())
                 .bind(self.ttl_seconds)
                 .execute(&self.pool),
             )
@@ -164,12 +164,12 @@ impl TaskAttributionStore for PostgresTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
-            let row: Option<(String, Option<String>)> = self
+            let row: Option<(Vec<u8>,)> = self
                 .run(
                     sqlx::query_as(
-                        "SELECT method, name FROM mcp_usage_task_attribution \
+                        "SELECT attribution FROM mcp_usage_task_attribution \
                  WHERE tenant_hash = $1 AND task_hash = $2 AND expires_at > NOW()",
                     )
                     .bind(identifier_hash(tenant_id).to_vec())
@@ -177,7 +177,8 @@ impl TaskAttributionStore for PostgresTaskStore {
                     .fetch_optional(&self.pool),
                 )
                 .await?;
-            Ok(row.map(|(method, name)| Call::new(Method::parse(&method), name)))
+            row.map(|(attribution,)| decode_attribution(&attribution))
+                .transpose()
         })
     }
 
@@ -185,21 +186,22 @@ impl TaskAttributionStore for PostgresTaskStore {
         &'a self,
         tenant_id: &'a str,
         task_id: &'a str,
-    ) -> TaskStoreFuture<'a, Option<Call>> {
+    ) -> TaskStoreFuture<'a, Option<TaskAttribution>> {
         Box::pin(async move {
-            let row: Option<(String, Option<String>)> = self
+            let row: Option<(Vec<u8>,)> = self
                 .run(
                     sqlx::query_as(
                         "DELETE FROM mcp_usage_task_attribution \
                  WHERE tenant_hash = $1 AND task_hash = $2 AND expires_at > NOW() \
-                 RETURNING method, name",
+                 RETURNING attribution",
                     )
                     .bind(identifier_hash(tenant_id).to_vec())
                     .bind(identifier_hash(task_id).to_vec())
                     .fetch_optional(&self.pool),
                 )
                 .await?;
-            Ok(row.map(|(method, name)| Call::new(Method::parse(&method), name)))
+            row.map(|(attribution,)| decode_attribution(&attribution))
+                .transpose()
         })
     }
 

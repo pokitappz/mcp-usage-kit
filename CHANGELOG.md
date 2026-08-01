@@ -15,6 +15,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   zero-duration window with `EdgeConfigError::InvalidAuthFailureWindow`.
 - `UsageBuffer`, `BillingPipeline`, and exporter Debug output now exposes counts
   and configuration bounds only, without buffered identifiers or payloads.
+- `TaskAttributionStore` now persists `TaskAttribution` instead of `Call`.
+  `TaskAttribution::from_call` resolves the price when a task is created and
+  discards identifying names and extension method text.
 
 ### Added
 
@@ -23,6 +26,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `StripeDeadLetterReason`, `with_dead_letter_capacity`, `dead_letter_count`,
   `dropped_dead_letters`, and `take_dead_letters` support explicit
   reconciliation without rewriting timestamps.
+- Stripe reconciliation also quarantines timestamps more than five minutes in
+  the future and individual events synchronously rejected as permanently
+  invalid, without blocking later valid events in the batch.
+- `StripeExporter::quarantine_async_rejection` lets an application retain an
+  original aggregate after it verifies and correlates Stripe's asynchronous
+  Meter Event failure notification.
+- Stripe transient retries retain process-local partial-batch progress, require
+  the identical batch, and skip events whose successful responses were already
+  confirmed.
 
 ### Fixed
 
@@ -49,6 +61,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `main` can advance, makes release tags immutable, and review-gates the release
   environment. The publish workflow independently verifies that a version tag
   points to a commit already on `main`.
+- Redis, Valkey, and PostgreSQL task-attribution values no longer contain raw
+  tool names, prompt names, resource URIs, or extension method strings. Their
+  versioned binary record contains only a fixed method category and resolved
+  integer units.
 - Both static pages declare restrictive Content Security Policies. The 404 page
   no longer embeds CSS, and site checks reject inline executable content.
 - CI backend images are pinned by digest as well as version. First-release
