@@ -633,9 +633,9 @@ impl Completion {
             .task
             .as_ref()
             .and_then(|task| task.task_id.as_deref());
+        let requested_task_id = self.request.requested_task_id.as_deref();
         if matches!(self.call.method, Method::TasksGet)
-            && let (Some(requested), Some(returned)) =
-                (self.request.requested_task_id.as_deref(), response_task_id)
+            && let (Some(requested), Some(returned)) = (requested_task_id, response_task_id)
             && requested != returned
         {
             // Never attribute one task's result to a differently requested
@@ -663,7 +663,7 @@ impl Completion {
             tracing::error!(error = %error, "failed to retain MCP task attribution");
         }
 
-        let response_task_id = response_task_id.or(self.request.requested_task_id.as_deref());
+        let cleanup_task_id = response_task_id.or(requested_task_id);
         let terminal_task = response.task.as_ref().is_some_and(|task| {
             matches!(
                 task.status,
@@ -674,23 +674,25 @@ impl Completion {
             .task
             .as_ref()
             .is_some_and(|task| matches!(task.status, TaskStatus::Completed));
-        let task_origin = if matches!(self.call.method, Method::TasksGet) && completed_task {
-            if let Some(task_id) = response_task_id {
-                match self.config.tasks.claim(&self.tenant.id, task_id).await {
-                    Ok(origin) => origin,
-                    Err(error) => {
-                        self.config.metrics.record_failure();
-                        tracing::error!(error = %error, "failed to claim MCP task attribution");
-                        None
+        let task_origin =
+            if matches!(self.call.method, Method::TasksGet) && completed_task && !response.is_error
+            {
+                if let Some(task_id) = response_task_id {
+                    match self.config.tasks.claim(&self.tenant.id, task_id).await {
+                        Ok(origin) => origin,
+                        Err(error) => {
+                            self.config.metrics.record_failure();
+                            tracing::error!(error = %error, "failed to claim MCP task attribution");
+                            None
+                        }
                     }
+                } else {
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
-        let charge = decide_with_task_attribution(
+            };
+        let charge = decide_with_task_origin(
             &self.call,
             &response,
             &self.tenant.prices,
@@ -735,7 +737,7 @@ impl Completion {
                 self.config.metrics.free();
                 if terminal_task
                     && !completed_task
-                    && let Some(task_id) = response_task_id
+                    && let Some(task_id) = cleanup_task_id
                     && let Err(error) = self.config.tasks.remove(&self.tenant.id, task_id).await
                 {
                     self.config.metrics.record_failure();
@@ -1435,6 +1437,93 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.billed, 1);
         assert_eq!(snapshot.record_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_completed_task_id_preserves_origin_for_a_later_valid_poll() {
+        let tasks = Arc::new(InMemoryTaskStore::new());
+        let config = EdgeConfig::new(task_tenants()).with_task_store(tasks.clone());
+        let metrics = config.metrics();
+        let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(move |_request: Request<Full<Bytes>>| {
+                let n = stage.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    let result = match n {
+                        0 => json!({
+                            "resultType":"task",
+                            "taskId":"task-1",
+                            "status":"working"
+                        }),
+                        1 => json!({
+                            "resultType":"complete",
+                            "status":"completed",
+                            "result":{}
+                        }),
+                        _ => json!({
+                            "resultType":"complete",
+                            "taskId":"task-1",
+                            "status":"completed",
+                            "result":{}
+                        }),
+                    };
+                    Ok::<_, Infallible>(response(&json!({
+                        "jsonrpc":"2.0",
+                        "id":n,
+                        "result":result
+                    })))
+                }
+            }));
+
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/call",
+                    Some("long_job"),
+                    &json!({"id":1,"params":{"name":"long_job"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":2,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the malformed poll must not consume the origin"
+        );
+        assert_eq!(metrics.snapshot().billed, 0);
+
+        release_without_end_of_stream(
+            service
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":3,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+
+        assert!(tasks.is_empty());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 1);
+        assert_eq!(snapshot.billed_units, 50);
     }
 
     #[tokio::test]
