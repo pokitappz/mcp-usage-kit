@@ -18,13 +18,12 @@ all-features = true
 [features]
 default = []
 postgres = ["dep:sqlx", "dep:tokio"]
-redis = ["dep:redis", "dep:serde_json", "dep:tokio"]
+redis = ["dep:redis", "dep:tokio"]
 
 [dependencies]
 mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
 mcp-usage-tower = { version = "0.1.0", path = "../mcp-usage-tower" }
 redis = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }

@@ -15,6 +15,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   zero-duration window with `EdgeConfigError::InvalidAuthFailureWindow`.
 - `UsageBuffer`, `BillingPipeline`, and exporter Debug output now exposes counts
   and configuration bounds only, without buffered identifiers or payloads.
+- `TaskAttributionStore` now persists `TaskAttribution` instead of `Call`.
+  `TaskAttribution::from_call` resolves the price when a task is created and
+  discards identifying names and extension method text.
 
 ### Added
 
@@ -45,6 +48,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Redis, Valkey, and PostgreSQL task-attribution values no longer contain raw
+  tool names, prompt names, resource URIs, or extension method strings. Their
+  versioned binary record contains only a fixed method category and resolved
+  integer units.
 - Both static pages declare restrictive Content Security Policies. The 404 page
   no longer embeds CSS, and site checks reject inline executable content.
 - CI backend images are pinned by digest as well as version. First-release

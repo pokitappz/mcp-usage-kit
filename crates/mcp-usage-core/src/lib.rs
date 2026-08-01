@@ -53,12 +53,13 @@
 //! # Where the state lives
 //!
 //! Nowhere in here. Durable tasks require the caller to retain two small pieces
-//! of state: the original call keyed by `taskId` (so a later `tasks/get`, which
-//! has no `Mcp-Name`, receives the right price) and the task IDs already billed
-//! (so repeated terminal polls are idempotent). This crate accepts the former in
-//! [`decide_with_task_origin`] and surfaces the latter as
-//! [`Billable::idempotency_key`]. Enforcement belongs to the caller, which is the
-//! only layer that knows whether it runs beside the origin or as a shared proxy.
+//! of state: pre-priced [`TaskAttribution`] keyed by `taskId` and the task IDs
+//! already billed. Resolving the price when the task is created avoids
+//! persisting a tool name, prompt name, resource URI, or extension method text.
+//! This crate accepts the former in [`decide_with_task_attribution`] and surfaces
+//! the latter as [`Billable::idempotency_key`]. Enforcement belongs to the
+//! caller, which is the only layer that knows whether it runs beside the origin
+//! or as a shared proxy.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::pedantic)]
@@ -72,7 +73,10 @@ pub mod peek;
 pub mod price;
 pub mod version;
 
-pub use charge::{Billable, Call, Charge, FreeReason, decide, decide_with_task_origin};
+pub use charge::{
+    Billable, Call, Charge, FreeReason, TaskAttribution, TaskOriginKind, decide,
+    decide_with_task_attribution, decide_with_task_origin,
+};
 pub use limits::{LimitDecision, LimitReason, Limits, Usage, assess_limits};
 pub use method::Method;
 pub use peek::{RequestPeek, ResponsePeek, ResultType, TaskPeek, TaskStatus};

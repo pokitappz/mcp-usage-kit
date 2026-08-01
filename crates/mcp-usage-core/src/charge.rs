@@ -67,6 +67,81 @@ impl Call {
     }
 }
 
+/// Non-identifying method category retained for a durable task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOriginKind {
+    /// A task created by `tools/call`.
+    ToolsCall,
+    /// A task created by `resources/read`.
+    ResourcesRead,
+    /// A task created by `prompts/get`.
+    PromptsGet,
+    /// A task created by an extension or unexpected method.
+    Other,
+}
+
+impl TaskOriginKind {
+    /// Reduce a method to a fixed category that cannot retain extension text.
+    #[must_use]
+    pub const fn from_method(method: &Method) -> Self {
+        match method {
+            Method::ToolsCall => Self::ToolsCall,
+            Method::ResourcesRead => Self::ResourcesRead,
+            Method::PromptsGet => Self::PromptsGet,
+            _ => Self::Other,
+        }
+    }
+
+    fn method(self) -> Method {
+        match self {
+            Self::ToolsCall => Method::ToolsCall,
+            Self::ResourcesRead => Method::ResourcesRead,
+            Self::PromptsGet => Method::PromptsGet,
+            Self::Other => Method::Other("[redacted-task-origin]".to_owned()),
+        }
+    }
+}
+
+/// Pre-priced durable-task attribution without the original name or URI.
+///
+/// Construct this when a task is created, then persist it under the task ID.
+/// The resolved units preserve named pricing while avoiding storage of a tool
+/// name, prompt name, resource URI, or extension method string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskAttribution {
+    origin_kind: TaskOriginKind,
+    units: u64,
+}
+
+impl TaskAttribution {
+    /// Construct an attribution from an already resolved method category and price.
+    #[must_use]
+    pub const fn new(origin_kind: TaskOriginKind, units: u64) -> Self {
+        Self { origin_kind, units }
+    }
+
+    /// Resolve a call against the current price book and discard identifying text.
+    #[must_use]
+    pub fn from_call(call: &Call, prices: &PriceBook) -> Self {
+        Self {
+            origin_kind: TaskOriginKind::from_method(&call.method),
+            units: prices.units_for(&call.method, call.name.as_deref()),
+        }
+    }
+
+    /// Fixed, non-identifying category of the call that created the task.
+    #[must_use]
+    pub const fn origin_kind(self) -> TaskOriginKind {
+        self.origin_kind
+    }
+
+    /// Units resolved when the task was created.
+    #[must_use]
+    pub const fn units(self) -> u64 {
+        self.units
+    }
+}
+
 /// A charge to record against a tenant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Billable {
@@ -157,6 +232,11 @@ pub fn decide(call: &Call, response: &ResponsePeek, prices: &PriceBook) -> Charg
     decide_with_task_origin(call, response, prices, None)
 }
 
+enum TaskPricing<'a> {
+    Call(&'a Call),
+    Attribution(&'a TaskAttribution),
+}
+
 /// Decide an exchange while supplying the call that created a polled task.
 ///
 /// A `tasks/get` request carries no `Mcp-Name`, so its terminal response cannot
@@ -169,6 +249,35 @@ pub fn decide_with_task_origin(
     response: &ResponsePeek,
     prices: &PriceBook,
     task_origin: Option<&Call>,
+) -> Charge {
+    decide_with_task_pricing(call, response, prices, task_origin.map(TaskPricing::Call))
+}
+
+/// Decide an exchange using pre-priced, non-identifying task attribution.
+///
+/// This is the privacy-preserving form for durable storage. The task's units
+/// are resolved when it is created, so a later terminal poll does not need the
+/// original name, URI, or extension method string.
+#[must_use]
+pub fn decide_with_task_attribution(
+    call: &Call,
+    response: &ResponsePeek,
+    prices: &PriceBook,
+    task_attribution: Option<&TaskAttribution>,
+) -> Charge {
+    decide_with_task_pricing(
+        call,
+        response,
+        prices,
+        task_attribution.map(TaskPricing::Attribution),
+    )
+}
+
+fn decide_with_task_pricing(
+    call: &Call,
+    response: &ResponsePeek,
+    prices: &PriceBook,
+    task_pricing: Option<TaskPricing<'_>>,
 ) -> Charge {
     if response.is_error {
         return Charge::Free(FreeReason::ProtocolError);
@@ -199,13 +308,23 @@ pub fn decide_with_task_origin(
                 let Some(task_id) = task.task_id.clone() else {
                     return Charge::Free(FreeReason::MissingTaskId);
                 };
-                let Some(origin) = task_origin else {
+                let Some(origin) = task_pricing else {
                     return Charge::Free(FreeReason::MissingTaskAttribution);
                 };
+                let (method, name, units) = match origin {
+                    TaskPricing::Call(origin) => (
+                        origin.method.clone(),
+                        origin.name.clone(),
+                        prices.units_for(&origin.method, origin.name.as_deref()),
+                    ),
+                    TaskPricing::Attribution(attribution) => {
+                        (attribution.origin_kind.method(), None, attribution.units)
+                    }
+                };
                 Charge::Billable(Billable {
-                    method: origin.method.clone(),
-                    name: origin.name.clone(),
-                    units: prices.units_for(&origin.method, origin.name.as_deref()),
+                    method,
+                    name,
+                    units,
                     // A terminal task reports `completed` to every later poll.
                     idempotency_key: Some(task_id),
                 })
@@ -551,5 +670,32 @@ mod tests {
         };
         assert_eq!(billable.method, Method::ToolsCall);
         assert_eq!(billable.name.as_deref(), Some("expensive_job"));
+    }
+
+    #[test]
+    fn prepriced_task_attribution_discards_identifying_names() {
+        let prices = PriceBook::flat(1).with_name("file:///private/customer-record", 250);
+        let origin = Call::new(
+            Method::ResourcesRead,
+            Some("file:///private/customer-record".to_owned()),
+        );
+        let attribution = TaskAttribution::from_call(&origin, &prices);
+
+        assert_eq!(attribution.units(), 250);
+        assert_eq!(attribution.origin_kind(), TaskOriginKind::ResourcesRead);
+        assert!(!format!("{attribution:?}").contains("customer-record"));
+
+        let charge = decide_with_task_attribution(
+            &Call::new(Method::TasksGet, None),
+            &task_poll("completed", "tsk_private"),
+            &prices,
+            Some(&attribution),
+        );
+        let Charge::Billable(billable) = charge else {
+            panic!("completed task should be billable");
+        };
+        assert_eq!(billable.units, 250);
+        assert_eq!(billable.method, Method::ResourcesRead);
+        assert_eq!(billable.name, None);
     }
 }
