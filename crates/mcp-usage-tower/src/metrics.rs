@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct EdgeMetrics {
     classified: AtomicU64,
     rejected: AtomicU64,
+    unauthenticated: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     billed: AtomicU64,
@@ -22,8 +23,12 @@ pub struct EdgeMetrics {
 pub struct MetricsSnapshot {
     /// Successfully classified requests.
     pub classified: u64,
-    /// Requests rejected before reaching the origin.
+    /// Requests rejected for malformed or ambiguous MCP headers.
     pub rejected: u64,
+    /// Requests refused for a missing, malformed, or unknown API key. Tracked
+    /// apart from `rejected` so credential stuffing is distinguishable from
+    /// clients that simply send bad protocol headers.
+    pub unauthenticated: u64,
     /// Responses served from cache.
     pub cache_hits: u64,
     /// Cacheable requests not served from cache.
@@ -48,6 +53,9 @@ impl EdgeMetrics {
     }
     pub(crate) fn rejected(&self) {
         saturating_add(&self.rejected, 1);
+    }
+    pub(crate) fn unauthenticated(&self) {
+        saturating_add(&self.unauthenticated, 1);
     }
     pub(crate) fn cache_hit(&self) {
         saturating_add(&self.cache_hits, 1);
@@ -78,6 +86,7 @@ impl EdgeMetrics {
         MetricsSnapshot {
             classified: self.classified.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
+            unauthenticated: self.unauthenticated.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
             billed: self.billed.load(Ordering::Relaxed),
@@ -113,8 +122,14 @@ impl MetricsSnapshot {
         append_metric(
             &mut output,
             "mcp_usage_rejected_total",
-            "MCP requests rejected before reaching the origin.",
+            "MCP requests rejected for malformed or ambiguous headers.",
             self.rejected,
+        );
+        append_metric(
+            &mut output,
+            "mcp_usage_unauthenticated_total",
+            "MCP requests refused for a missing, malformed, or unknown API key.",
+            self.unauthenticated,
         );
         append_metric(
             &mut output,

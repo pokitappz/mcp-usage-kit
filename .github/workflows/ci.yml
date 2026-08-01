@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Advisories are published against code that is already merged, so waiting for
+  # the next push means a known-vulnerable dependency sits undetected until
+  # someone happens to commit.
+  schedule:
+    - cron: "17 6 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The event name keeps the nightly advisory run from cancelling, or being
+  # cancelled by, ordinary branch CI.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,7 +25,7 @@ jobs:
     name: Format, lint, test, document, and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Check formatting
@@ -38,7 +45,7 @@ jobs:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install the minimum supported Rust version
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Check the workspace
@@ -52,7 +59,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Check every crate
@@ -62,7 +69,7 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install cargo-audit
@@ -70,11 +77,23 @@ jobs:
       - name: Check RustSec advisories
         run: cargo +stable audit
 
+  deny:
+    name: License, source, and ban checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-deny
+        run: cargo +stable install cargo-deny --locked --version 0.20.2
+      - name: Check licenses, sources, bans, and advisories
+        run: cargo +stable deny --all-features check
+
   site:
     name: Static site checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Check JavaScript syntax
         run: |
           node --check site/app.js
