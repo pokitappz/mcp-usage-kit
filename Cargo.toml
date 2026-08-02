@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -21,6 +21,12 @@ categories = ["asynchronous", "network-programming", "web-programming::http-serv
 # Shared dependency versions are pinned here so every crate stays in lockstep,
 # following the convention in the `addressing` workspace.
 #
+# The workspace crates depend on each other, and every one of those requirements
+# has to move in lockstep with `workspace.package.version` or the
+# dependency-ordered publish fails partway through, leaving some crates released
+# at the new version and the rest not. Declaring them here means the bump is one
+# edit; `scripts/check-release-version.sh` verifies it in CI regardless.
+#
 # `mcp-usage-core` is the thinnest crate: it is the billing-semantics engine, it
 # performs NO I/O, and it must stay cheap to audit. It gets serde (for
 # price-book config), serde_json (for the bounded body peeks the spec forces on us
@@ -28,6 +34,11 @@ categories = ["asynchronous", "network-programming", "web-programming::http-serv
 # sentinel encoding). Nothing else. Async, HTTP, tower, and rmcp all belong to the
 # crates above it.
 [workspace.dependencies]
+mcp-usage-core = { version = "0.2.0", path = "crates/mcp-usage-core" }
+mcp-usage-export = { version = "0.2.0", path = "crates/mcp-usage-export" }
+mcp-usage-tower = { version = "0.2.0", path = "crates/mcp-usage-tower" }
+mcp-usage-store = { version = "0.2.0", path = "crates/mcp-usage-store" }
+
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 base64 = "0.22.1"

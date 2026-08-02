@@ -39,6 +39,30 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
           RELEASE_BASE_REF: refs/remotes/origin/main
         run: bash scripts/check-release-version.sh
+      # Trusted publishing needs a trusted publisher, which can only be
+      # configured on a crate that already exists. For a crate's first version
+      # there is nothing to configure against, so the OIDC exchange below cannot
+      # succeed. Without this the run gets most of the way through and then
+      # fails at authentication, or worse publishes some crates and not others.
+      # See the first-release procedure in RELEASE.md.
+      - name: Refuse a first release
+        run: |
+          unpublished=""
+          for crate in mcp-usage-core mcp-usage-export mcp-usage-tower \
+                       mcp-usage-store mcp-usage-kit; do
+            # From inside the workspace `cargo info` answers from the local
+            # path and reports every crate as present, so this has to ask the
+            # registry from somewhere the workspace cannot satisfy it.
+            if ! (cd "$RUNNER_TEMP" && cargo +stable info "$crate") >/dev/null 2>&1; then
+              unpublished="$unpublished $crate"
+            fi
+          done
+          if [[ -n "$unpublished" ]]; then
+            echo "Not on crates.io:$unpublished" >&2
+            echo "The first version of a crate cannot use trusted publishing." >&2
+            echo "Follow the 'First release' section of RELEASE.md instead." >&2
+            exit 1
+          fi
       - name: Test the release
         run: cargo +stable test --workspace --all-targets --all-features --locked
       - name: Build publishable archives

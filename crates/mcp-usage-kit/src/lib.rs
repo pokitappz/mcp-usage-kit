@@ -33,17 +33,25 @@ pub use mcp_usage_core::{
     TaskAttribution, TaskOriginKind, Usage, assess_limits, decide, decide_with_task_attribution,
     decide_with_task_origin,
 };
+// `ExportError`, `ExportFuture`, and `RecordError` appear in the signatures of
+// `BatchExporter` and `UsageRecorder`, so an application cannot implement either
+// re-exported trait without them. `MeterBody` is the response body of the
+// re-exported `MeterService` and is unavoidable in an application's own type
+// signatures. The point of this crate is one `cargo add`, so anything reachable
+// from a re-exported item's signature is re-exported too.
 pub use mcp_usage_export::{
-    AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, FnExporter, LogExporter,
-    NoopRecorder, RecordOutcome, SharedExporter, UsageEvent, UsageRecorder,
+    AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, ExportError, ExportFuture,
+    FnExporter, LogExporter, NoopRecorder, RecordError, RecordOutcome, SharedExporter,
+    SharedRecorder, UsageBuffer, UsageEvent, UsageRecorder,
 };
 #[cfg(feature = "stripe")]
 pub use mcp_usage_export::{StripeDeadLetter, StripeDeadLetterReason, StripeExporter};
 pub use mcp_usage_tower::{
-    DeferredCompletions, EdgeConfig, EdgeConfigError, EdgeMetrics, InMemoryTaskStore,
-    InMemoryTenantStore, MIN_API_KEY_BYTES, MeterLayer, MeterService, MetricsSnapshot,
+    API_KEY_HEADER, DeferredCompletions, EdgeConfig, EdgeConfigError, EdgeMetrics,
+    InMemoryTaskStore, InMemoryTenantStore, METHOD_HEADER, MIN_API_KEY_BYTES, MeterBody,
+    MeterLayer, MeterService, MetricsSnapshot, NAME_HEADER, PROTOCOL_VERSION_HEADER,
     TaskAttributionStore, TaskStoreError, TaskStoreFuture, Tenant, TenantStore, WeakApiKey,
-    validate_api_key_strength,
+    hash_api_key, validate_api_key_strength,
 };
 
 #[cfg(feature = "opentelemetry")]

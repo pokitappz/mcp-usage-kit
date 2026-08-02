@@ -514,16 +514,28 @@ fn extract_api_key(headers: &HeaderMap) -> Result<&str, CredentialError> {
         (None, None) => return Err(CredentialError::Missing),
         (Some(_), Some(_)) => return Err(CredentialError::Invalid),
         (Some(value), None) => value.to_str().map_err(|_| CredentialError::Invalid)?,
-        (None, Some(value)) => value
-            .to_str()
-            .map_err(|_| CredentialError::Invalid)?
-            .strip_prefix("Bearer ")
+        (None, Some(value)) => bearer_token(value.to_str().map_err(|_| CredentialError::Invalid)?)
             .ok_or(CredentialError::Invalid)?,
     };
     if value.is_empty() {
         return Err(CredentialError::Invalid);
     }
     Ok(value)
+}
+
+/// The token from an `Authorization: Bearer` credential.
+///
+/// The scheme name is matched case-insensitively, because RFC 7235 defines it
+/// that way and real clients send `bearer`. Matching it exactly turns a
+/// conforming request into a `401` that looks, from the caller's side, exactly
+/// like a wrong key. RFC 7235 also permits more than one space before the
+/// token, while RFC 6750's `token68` cannot itself begin with one, so leading
+/// space is separator rather than credential.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim_start_matches(' '))
 }
 
 /// Refuse a request whose credential did not authenticate.
@@ -692,7 +704,7 @@ impl Completion {
             } else {
                 None
             };
-        let charge = decide_with_task_origin(
+        let charge = decide_with_task_attribution(
             &self.call,
             &response,
             &self.tenant.prices,
@@ -2214,6 +2226,52 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.unauthenticated, 1);
         assert_eq!(snapshot.rejected, 1);
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_matched_case_insensitively() {
+        // RFC 7235 makes the scheme name case-insensitive, so all of these are
+        // the same credential and none of them is a wrong key.
+        for header in [
+            "Bearer secret",
+            "bearer secret",
+            "BEARER secret",
+            "BeArEr secret",
+            // RFC 7235 allows more than one space before the token.
+            "Bearer   secret",
+        ] {
+            assert_eq!(bearer_token(header), Some("secret"), "{header}");
+        }
+
+        // A different scheme is still not a bearer token.
+        for header in ["Basic secret", "Bearersecret", "secret", "", " secret"] {
+            assert_ne!(bearer_token(header), Some("secret"), "{header}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lowercase_bearer_credential_authenticates() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(EdgeConfig::new(tenants)))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                })))
+            }));
+
+        let mut call = request("tools/list", None, &json!({"id":1,"params":{}}), "secret");
+        call.headers_mut().remove(crate::API_KEY_HEADER);
+        call.headers_mut().insert(
+            AUTHORIZATION,
+            http::HeaderValue::from_static("bearer secret"),
+        );
+
+        assert_eq!(
+            service.oneshot(call).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     #[test]

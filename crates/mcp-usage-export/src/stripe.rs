@@ -247,7 +247,9 @@ impl StripeExporter {
         match &state.retry_progress {
             Some(progress) if progress.identifiers != identifiers => {
                 return Err(ExportError::Provider(
-                    "Stripe requires the incomplete batch to be retried first".to_owned(),
+                    "Stripe requires the incomplete batch to be retried first; \
+                     call abandon_retry_progress to give up on it"
+                        .to_owned(),
                 ));
             }
             Some(_) => {}
@@ -291,6 +293,48 @@ impl StripeExporter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retry_progress = None;
     }
+
+    /// Whether an incomplete batch is still owed a retry.
+    ///
+    /// True between a partially-failed export and the successful retry of that
+    /// same batch. While it is true, [`BatchExporter::export`] accepts only the
+    /// identical batch and refuses any other.
+    #[must_use]
+    pub fn retry_in_progress(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_progress
+            .is_some()
+    }
+
+    /// Give up on the incomplete batch so a different one can be exported.
+    ///
+    /// Returns the identifiers of that batch's events which were *not* yet
+    /// confirmed accepted by Stripe, so the caller can reconcile them. An empty
+    /// result means nothing was owed.
+    ///
+    /// Requiring the identical batch on retry is what stops confirmed events
+    /// from being resubmitted, but on its own it is a trap: if the batch's owner
+    /// goes away without retrying it, every later batch is refused and the
+    /// exporter stops billing entirely. Only the application knows the batch is
+    /// gone, so only the application can decide to abandon it, and the
+    /// identifiers come back rather than being silently dropped.
+    pub fn abandon_retry_progress(&self) -> Vec<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(progress) = state.retry_progress.take() else {
+            return Vec::new();
+        };
+        progress
+            .identifiers
+            .into_iter()
+            .zip(progress.completed)
+            .filter_map(|(identifier, completed)| (!completed).then_some(identifier))
+            .collect()
+    }
 }
 
 fn disallowed_endpoint() -> ExportError {
@@ -311,6 +355,10 @@ impl fmt::Debug for StripeExporter {
                 "export_in_progress",
                 &self.exporting.load(Ordering::Relaxed),
             )
+            // Surfaced because a stuck retry refuses every other batch, and an
+            // operator staring at a silent exporter needs to see that from the
+            // outside. The identifiers themselves stay out of Debug output.
+            .field("retry_in_progress", &self.retry_in_progress())
             .finish_non_exhaustive()
     }
 }
@@ -386,12 +434,29 @@ fn timestamp_too_far_in_future(timestamp: u64, now: u64) -> bool {
     timestamp > now.saturating_add(MAX_FUTURE_SECONDS)
 }
 
+/// Whether this status means *this event* is invalid and always will be.
+///
+/// Quarantining is a one-way door for revenue: the pipeline treats a
+/// quarantined event as exported and drops it, and the dead letter queue is
+/// bounded, so anything mistakenly classified here is eventually discarded. The
+/// exclusions are therefore statuses that describe the *request or the account*
+/// rather than the event, and every one of them applies identically to a whole
+/// batch:
+///
+/// - `401`, `403`: the key is wrong or lacks permission.
+/// - `402`: the Stripe account cannot currently be billed.
+/// - `404`: no such endpoint. A mistyped path answers this for every event, so
+///   treating it as a per-event rejection would silently quarantine all usage
+///   and report success. Failing loudly leaves the batch retryable.
+/// - `408`, `424`, `429`: timeout, upstream dependency, rate limit.
 fn permanent_event_rejection(status: reqwest::StatusCode) -> bool {
     status.is_client_error()
         && !matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::PAYMENT_REQUIRED
                 | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::NOT_FOUND
                 | reqwest::StatusCode::REQUEST_TIMEOUT
                 | reqwest::StatusCode::FAILED_DEPENDENCY
                 | reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -568,7 +633,13 @@ mod tests {
     fn provider_http_classification_keeps_retryable_failures_out_of_dead_letters() {
         for status in [
             reqwest::StatusCode::UNAUTHORIZED,
+            // The account cannot be billed. That is not this event's fault.
+            reqwest::StatusCode::PAYMENT_REQUIRED,
             reqwest::StatusCode::FORBIDDEN,
+            // A mistyped endpoint path answers 404 for every event in every
+            // batch. Quarantining on it would discard all usage and report
+            // success; the loud failure keeps the batch retryable.
+            reqwest::StatusCode::NOT_FOUND,
             reqwest::StatusCode::REQUEST_TIMEOUT,
             reqwest::StatusCode::FAILED_DEPENDENCY,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -578,12 +649,49 @@ mod tests {
         }
         for status in [
             reqwest::StatusCode::BAD_REQUEST,
-            reqwest::StatusCode::PAYMENT_REQUIRED,
-            reqwest::StatusCode::NOT_FOUND,
             reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         ] {
             assert!(permanent_event_rejection(status), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_endpoint_path_fails_loudly_instead_of_discarding_usage() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = receive_form_request(&listener).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exporter = StripeExporter::new("sk_test_do_not_log")
+            .with_endpoint(format!("http://{address}/v1/mistyped"))
+            .unwrap();
+
+        let result = exporter.export(&[aggregate("fresh", now)]).await;
+        server.await.unwrap();
+
+        assert!(
+            result.is_err(),
+            "a wrong endpoint must not report a successful export"
+        );
+        assert_eq!(
+            exporter.dead_letter_count(),
+            0,
+            "usage must stay retryable rather than being quarantined"
+        );
     }
 
     #[tokio::test]
@@ -697,6 +805,71 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_batch_stops_wedging_every_later_export() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for request_index in 0..3 {
+                let (mut stream, body) = receive_form_request(&listener).await;
+                // Only the first event of the first batch fails.
+                let status = if request_index == 1 {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                requests.push(body);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let abandoned = [aggregate("sent", now - 2), aggregate("never-sent", now - 1)];
+        let next = [aggregate("later-batch", now)];
+        let exporter = StripeExporter::new("sk_test_do_not_log")
+            .with_endpoint(format!("http://{address}/v1/billing/meter_events"))
+            .unwrap();
+
+        assert!(exporter.export(&abandoned).await.is_err());
+        assert!(exporter.retry_in_progress());
+
+        // Whoever owned that batch is gone. Until it is abandoned the exporter
+        // refuses everything else, which would silently stop billing.
+        let refused = exporter.export(&next).await.unwrap_err();
+        assert!(
+            format!("{refused}").contains("abandon_retry_progress"),
+            "the refusal must name the way out: {refused}"
+        );
+
+        // Only the event Stripe never confirmed comes back for reconciliation.
+        assert_eq!(exporter.abandon_retry_progress(), vec!["never-sent"]);
+        assert!(!exporter.retry_in_progress());
+        assert!(exporter.abandon_retry_progress().is_empty());
+
+        exporter.export(&next).await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("identifier=sent"));
+        assert!(requests[1].contains("identifier=never-sent"));
+        assert!(requests[2].contains("identifier=later-batch"));
     }
 
     #[tokio::test]

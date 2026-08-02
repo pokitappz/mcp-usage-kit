@@ -20,6 +20,27 @@ if [[ "$RELEASE_TAG" != "v$versions" ]]; then
   exit 1
 fi
 
+# The crates depend on each other, and `cargo publish` resolves those
+# requirements against the registry rather than against the path. A requirement
+# left behind at the previous version is invisible to `cargo package` and to
+# every CI job, then fails partway through the dependency-ordered publish, with
+# the earlier crates already released and unpublishable again. Catch it here.
+stale_internal_requirements="$(
+  cargo metadata --no-deps --format-version 1 |
+    jq -r --arg version "$versions" '
+      .packages[] as $package
+      | $package.dependencies[]
+      | select(.path != null and .req != ("^" + $version))
+      | "\($package.name) -> \(.name) \(.req)"
+    '
+)"
+
+if [[ -n "$stale_internal_requirements" ]]; then
+  echo "Workspace dependency requirements do not match version $versions:" >&2
+  printf '%s\n' "$stale_internal_requirements" >&2
+  exit 1
+fi
+
 release_commitish="${RELEASE_COMMIT:-refs/tags/$RELEASE_TAG}"
 release_base_ref="${RELEASE_BASE_REF:-refs/remotes/origin/main}"
 
