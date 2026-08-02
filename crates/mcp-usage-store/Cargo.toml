@@ -21,8 +21,8 @@ postgres = ["dep:sqlx", "dep:tokio"]
 redis = ["dep:redis", "dep:tokio"]
 
 [dependencies]
-mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
-mcp-usage-tower = { version = "0.1.0", path = "../mcp-usage-tower" }
+mcp-usage-core = { workspace = true }
+mcp-usage-tower = { workspace = true }
 redis = { workspace = true, optional = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, optional = true }

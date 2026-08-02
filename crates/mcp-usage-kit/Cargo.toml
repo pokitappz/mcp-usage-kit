@@ -23,10 +23,10 @@ redis = ["dep:mcp-usage-store", "mcp-usage-store/redis"]
 stripe = ["mcp-usage-export/stripe"]
 
 [dependencies]
-mcp-usage-export = { version = "0.1.0", path = "../mcp-usage-export" }
-mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
-mcp-usage-tower = { version = "0.1.0", path = "../mcp-usage-tower" }
-mcp-usage-store = { version = "0.1.0", path = "../mcp-usage-store", optional = true }
+mcp-usage-export = { workspace = true }
+mcp-usage-core = { workspace = true }
+mcp-usage-tower = { workspace = true }
+mcp-usage-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }

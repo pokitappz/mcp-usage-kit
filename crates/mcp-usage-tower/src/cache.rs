@@ -60,6 +60,14 @@ impl ResponseCache {
         }
     }
 
+    /// Look up a cached response, preferring the caller's private entry.
+    ///
+    /// Expiry is checked per key rather than by sweeping the map. A lookup runs
+    /// on every cacheable request, and sweeping made it cost time proportional
+    /// to the whole cache while holding the lock, so raising `max_entries`
+    /// slowed down every reader. Whichever of the two keys is examined and
+    /// found expired is dropped here, and [`ResponseCache::insert`] still sweeps
+    /// globally, so expired responses do not accumulate.
     pub fn get(
         &self,
         logical: [u8; 32],
@@ -71,7 +79,6 @@ impl ResponseCache {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entries.retain(|_, entry| entry.expires_at > now);
         let private = CacheKey {
             logical,
             private_tenant: Some(authorization_context.to_owned()),
@@ -80,12 +87,23 @@ impl ResponseCache {
             logical,
             private_tenant: None,
         };
-        let mut response = state
-            .entries
-            .get(&private)
-            .or_else(|| state.entries.get(&public))?
-            .response
-            .clone();
+        // The private entry wins, but only while it is live: an expired private
+        // representation must not shadow a still-valid shared one, which is what
+        // the sweep used to guarantee.
+        let mut response = None;
+        for key in [private, public] {
+            match state.entries.get(&key) {
+                Some(entry) if entry.expires_at > now => {
+                    response = Some(entry.response.clone());
+                    break;
+                }
+                Some(_) => {
+                    state.entries.remove(&key);
+                }
+                None => {}
+            }
+        }
+        let mut response = response?;
         if let Some(id) = request_id
             && let Some(object) = response.body.as_object_mut()
         {
@@ -159,6 +177,15 @@ impl ResponseCache {
                 inserted_at: now,
             },
         );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
     }
 }
 
@@ -275,6 +302,51 @@ mod tests {
             Duration::from_secs(30),
             stored(body),
         );
+    }
+
+    #[test]
+    fn an_expired_entry_is_never_served_and_does_not_linger() {
+        // Lookups no longer sweep the whole map, so expiry has to hold on the
+        // key actually being read, and the dead entry has to go with it rather
+        // than keeping a stale tenant's body in memory past its TTL.
+        let cache = ResponseCache::new(16, Duration::from_secs(60), false);
+        cache.insert(
+            [7; 32],
+            "tenant-a",
+            CacheScope::Private,
+            Duration::from_millis(20),
+            stored(json!({"r": "a"})),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get([7; 32], "tenant-a", None).is_some());
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            cache.get([7; 32], "tenant-a", None).is_none(),
+            "an expired response must not be served"
+        );
+        assert_eq!(cache.len(), 0, "the expired entry must be dropped on read");
+    }
+
+    #[test]
+    fn a_lookup_does_not_disturb_other_live_entries() {
+        // The old sweep touched every key on every read. Nothing else may be
+        // evicted now that lookups only examine the two keys they need.
+        let cache = ResponseCache::new(16, Duration::from_secs(60), false);
+        put(&cache, "tenant-a", CacheScope::Private, json!({"r": "a"}));
+        cache.insert(
+            [9; 32],
+            "tenant-b",
+            CacheScope::Private,
+            Duration::from_secs(30),
+            stored(json!({"r": "b"})),
+        );
+
+        assert!(cache.get([1; 32], "tenant-c", None).is_none());
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get([7; 32], "tenant-a", None).unwrap().body["r"], "a");
+        assert_eq!(cache.get([9; 32], "tenant-b", None).unwrap().body["r"], "b");
     }
 
     #[test]

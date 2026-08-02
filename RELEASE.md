@@ -16,19 +16,37 @@ Administration write permission.
 
 ## Prepare a release
 
-1. Confirm the five package names are still available for the first release.
-2. Update `workspace.package.version` in `Cargo.toml` and regenerate
-   `Cargo.lock`.
-3. Move the relevant changelog entries from Unreleased into a dated version.
-4. Merge the release commit to `main` and wait for every required CI check.
-5. Run the complete CI command set from `CONTRIBUTING.md`.
-6. Run `cargo package --workspace --locked --no-verify` and inspect each
-   generated archive. Before the first release, verification cannot resolve the
-   workspace crates from crates.io. The dependency-ordered `cargo publish`
-   commands below perform full package verification once each prerequisite is
-   visible in the registry.
+1. Update `workspace.package.version` in `Cargo.toml` and regenerate
+   `Cargo.lock`. That single value also drives the internal dependency
+   requirements, which are declared once in `[workspace.dependencies]`;
+   `scripts/check-release-version.sh` fails the build if any of them drift,
+   because a stale one is invisible until it breaks a partially-completed
+   publish.
+2. Move the relevant changelog entries from Unreleased into a dated version.
+3. Merge the release commit to `main` and wait for every required CI check.
+4. Run the complete CI command set from `CONTRIBUTING.md`.
+5. Run `cargo package --workspace --locked` and inspect each generated archive.
+   Verification resolves the sibling crates from the archives built in the same
+   run, so this works even when none of them are in the registry yet.
 
 ## First release
+
+**As of v0.2.0 none of the five crates has been published**, so the next release
+is the first one and must take this path. Confirm with:
+
+```sh
+for c in mcp-usage-core mcp-usage-export mcp-usage-tower mcp-usage-store mcp-usage-kit; do
+  cargo info "$c" >/dev/null 2>&1 && echo "$c is published" || echo "$c is unpublished"
+done
+```
+
+Run that from outside this workspace. Inside it, `cargo info` resolves the local
+path and reports every crate as present regardless of the registry.
+
+Do **not** create a GitHub release for the first version. `release.yml` obtains
+its token through OIDC trusted publishing, which requires a trusted publisher
+that can only be configured on a crate that already exists; the workflow
+refuses to run for an unpublished crate rather than failing halfway through.
 
 crates.io requires the first version of each new crate to be published with a
 regular API token. Publish in this order, allowing the registry index to expose
@@ -56,10 +74,10 @@ workspace version alone is not sufficient.
 
 ## Later releases
 
-Create and publish a GitHub release whose tag exactly matches the workspace
-version, such as `v0.2.0`. The release workflow validates, packages, obtains a
-short-lived crates.io token through OIDC, and publishes the crates in dependency
-order. The release commit must already be merged to `main`, and the tag cannot
+Once every crate exists on crates.io and has a trusted publisher, create and
+publish a GitHub release whose tag exactly matches the workspace version, such
+as `v0.3.0`. The release workflow validates, packages, obtains a short-lived
+crates.io token through OIDC, and publishes the crates in dependency order. The release commit must already be merged to `main`, and the tag cannot
 be moved or deleted after creation. A release cannot be overwritten or removed
 from crates.io, so verify the tag and generated packages before approving the
 environment.

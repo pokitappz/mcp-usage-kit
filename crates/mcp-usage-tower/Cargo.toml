@@ -20,8 +20,8 @@ default = []
 opentelemetry = ["dep:opentelemetry"]
 
 [dependencies]
-mcp-usage-export = { version = "0.1.0", path = "../mcp-usage-export" }
-mcp-usage-core = { version = "0.1.0", path = "../mcp-usage-core" }
+mcp-usage-export = { workspace = true }
+mcp-usage-core = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
