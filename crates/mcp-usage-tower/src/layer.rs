@@ -15,7 +15,8 @@ use http_body::{Body, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use mcp_usage_core::{
-    Call, Charge, Method, ResultType, TaskAttribution, TaskStatus, decide_with_task_attribution,
+    Call, Charge, Method, ResultType, TaskAttribution, TaskStatus, TrustFailure,
+    decide_with_task_attribution, validate_header,
 };
 use mcp_usage_export::{NoopRecorder, RecordOutcome, SharedRecorder, UsageEvent};
 use serde_json::{Value, json};
@@ -24,7 +25,7 @@ use tower::{Layer, Service};
 
 use crate::auth::{AuthFailureLimit, Tenant, TenantStore, hash_api_key};
 use crate::cache::{CachedResponse, RequestMetadata, ResponseCache, cache_hints, inspect_request};
-use crate::classify::classify_protocol_headers;
+use crate::classify::{ClassificationError, classify_protocol_headers};
 use crate::deferred::DeferredCompletions;
 use crate::metrics::EdgeMetrics;
 use crate::task::{InMemoryTaskStore, TaskAttributionStore};
@@ -72,6 +73,7 @@ pub struct EdgeConfig {
     deferred: Arc<DeferredCompletions>,
     deferred_drain_per_request: usize,
     auth_failure_limit: Option<Arc<AuthFailureLimit>>,
+    strict_protocol_version: bool,
 }
 
 impl std::fmt::Debug for EdgeConfig {
@@ -82,6 +84,7 @@ impl std::fmt::Debug for EdgeConfig {
             .field("max_response_capture", &self.max_response_capture)
             .field("share_public_cache", &self.share_public_cache)
             .field("forward_credentials", &self.forward_credentials)
+            .field("strict_protocol_version", &self.strict_protocol_version)
             .field("deferred_pending", &self.deferred.len())
             .finish_non_exhaustive()
     }
@@ -111,6 +114,7 @@ impl EdgeConfig {
             deferred: Arc::new(DeferredCompletions::new(DEFAULT_DEFERRED_CAPACITY)),
             deferred_drain_per_request: DEFAULT_DEFERRED_DRAIN_PER_REQUEST,
             auth_failure_limit: None,
+            strict_protocol_version: false,
         }
     }
 
@@ -126,6 +130,22 @@ impl EdgeConfig {
             self.cache_max_ttl,
             self.share_public_cache,
         ));
+    }
+
+    /// Refuse requests that predate the mirrored headers instead of reading their body.
+    ///
+    /// By default a legacy request is classified from its JSON-RPC body, which is what
+    /// lets clients older than [`mcp_usage_core::version::HEADER_VALIDATION_SINCE`] -
+    /// still the majority - reach the origin at all. The body is the document the origin
+    /// executes, so pricing on it cannot be gamed the way pricing on unvalidated headers
+    /// can; the cost is one bounded JSON parse per legacy request.
+    ///
+    /// Set this when a deployment would rather serve only modern clients than spend that
+    /// parse, or when an upstream proxy already guarantees the revision.
+    #[must_use]
+    pub fn with_strict_protocol_version(mut self, strict: bool) -> Self {
+        self.strict_protocol_version = strict;
+        self
     }
 
     /// Install the hot-path usage recorder.
@@ -335,17 +355,23 @@ where
 
         Box::pin(async move {
             let (mut parts, request_body) = request.into_parts();
-            let protocol = match classify_request_headers(&parts.headers) {
-                Ok(protocol) => protocol,
-                Err(message) => {
-                    config.metrics.rejected();
-                    return Ok(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "INVALID_MCP_HEADERS",
-                        &message,
-                    ));
-                }
-            };
+            // Classification runs before authentication so a malformed request is
+            // refused without consulting the tenant store. A legacy request cannot be
+            // classified from headers at all, so it is deferred to the body - but only
+            // after the credential gate below, so unauthenticated traffic never buys a
+            // JSON parse.
+            let classification =
+                match classify_request_headers(&parts.headers, config.strict_protocol_version) {
+                    Ok(classification) => classification,
+                    Err(message) => {
+                        config.metrics.rejected();
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "INVALID_MCP_HEADERS",
+                            &message,
+                        ));
+                    }
+                };
             let api_key = match extract_api_key(&parts.headers) {
                 Ok(api_key) => api_key,
                 Err(error) => {
@@ -392,6 +418,18 @@ where
                         ));
                     }
                 };
+            let legacy = classification.is_from_body();
+            let protocol = match classification.resolve(&request_bytes) {
+                Ok(protocol) => protocol,
+                Err(message) => {
+                    config.metrics.rejected();
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "INVALID_MCP_HEADERS",
+                        &message,
+                    ));
+                }
+            };
             let metadata = inspect_request(&protocol.call, &request_bytes);
             if let Some(key) = metadata.cache_key
                 && let Some(cached) =
@@ -412,6 +450,7 @@ where
                     config,
                     tenant,
                     authorization_context,
+                    legacy,
                     call: protocol.call,
                     request: cached_request,
                     response_status: cached.status,
@@ -439,6 +478,7 @@ where
                 config,
                 tenant,
                 authorization_context,
+                legacy,
                 call: protocol.call,
                 request: metadata,
                 response_status: parts.status,
@@ -464,17 +504,74 @@ struct ClassifiedCall {
     call: Call,
 }
 
-fn classify_request_headers(headers: &HeaderMap) -> Result<ClassifiedCall, String> {
+/// The outcome of looking at the request headers alone.
+enum Classification {
+    /// The revision mandates header/body validation, so the headers priced the call
+    /// and the body is never parsed.
+    FromHeaders(ClassifiedCall),
+    /// A legacy revision. The call is priced from the body once it has been read.
+    FromBody,
+}
+
+impl Classification {
+    /// Whether the call was priced from the body rather than from trusted headers.
+    const fn is_from_body(&self) -> bool {
+        matches!(self, Self::FromBody)
+    }
+
+    /// Finish classification, reading the body only when the headers could not be
+    /// trusted. Called after the credential gate.
+    fn resolve(self, body: &[u8]) -> Result<ClassifiedCall, String> {
+        match self {
+            Self::FromHeaders(classified) => Ok(classified),
+            Self::FromBody => {
+                let (method, name) =
+                    mcp_usage_core::classify_body(body).map_err(|error| error.to_string())?;
+                Ok(ClassifiedCall {
+                    call: Call::new(method, name),
+                })
+            }
+        }
+    }
+}
+
+fn classify_request_headers(headers: &HeaderMap, strict: bool) -> Result<Classification, String> {
     let version = optional_header_str(headers, PROTOCOL_VERSION_HEADER)?;
     let method = optional_header_str(headers, METHOD_HEADER)?;
     let name = optional_header_str(headers, NAME_HEADER)?;
+
+    // Trust is settled before anything else, because "this client is old" and "this
+    // client is broken" deserve different answers.
+    if let Err(failure) = validate_header(version) {
+        return match failure {
+            // A version that is not a date is not a revision we can reason about. It is
+            // a malfunctioning or probing client, not a legacy one, so it is refused
+            // whatever the fallback setting - reading its body would reward the garbage.
+            TrustFailure::MalformedVersion(_) => {
+                Err(ClassificationError::UntrustedVersion(failure.to_string()).to_string())
+            }
+            // Absent or pre-validation revisions are the ordinary legacy client. Price
+            // it from the body unless this deployment asked to serve only modern ones.
+            TrustFailure::MissingVersionHeader | TrustFailure::UnvalidatedRevision(_) => {
+                if strict {
+                    Err(ClassificationError::UntrustedVersion(failure.to_string()).to_string())
+                } else {
+                    Ok(Classification::FromBody)
+                }
+            }
+        };
+    }
+
+    // Trusted revision: the origin is obliged to reject header/body disagreement, so the
+    // headers price the call and the body is never parsed. A modern request with a
+    // missing or malformed Mcp-Method is still an error - it claimed to mirror headers.
     let classified = classify_protocol_headers(version, method, name).map_err(|e| e.to_string())?;
-    Ok(ClassifiedCall {
+    Ok(Classification::FromHeaders(ClassifiedCall {
         call: Call::new(
             classified.method,
             classified.name.map(std::borrow::Cow::into_owned),
         ),
-    })
+    }))
 }
 
 fn optional_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, String> {
@@ -621,6 +718,8 @@ struct Completion {
     config: Arc<EdgeConfig>,
     tenant: Tenant,
     authorization_context: String,
+    /// The request predated mirrored headers, so its response predates `resultType`.
+    legacy: bool,
     call: Call,
     request: RequestMetadata,
     response_status: StatusCode,
@@ -640,6 +739,13 @@ impl Completion {
             return;
         };
         let response = mcp_usage_core::peek::response(&body);
+        // A legacy server cannot say "complete"; on those revisions a result is the
+        // delivered work. Without this every legacy call would meter as free.
+        let response = if self.legacy {
+            response.with_legacy_delivery()
+        } else {
+            response
+        };
 
         let response_task_id = response
             .task
@@ -1555,6 +1661,237 @@ mod tests {
         assert!(deferred.is_empty());
     }
 
+    /// A legacy client sends no mirrored headers at all. Before the body fallback the
+    /// edge refused it outright, which shut out every client older than the mirrored
+    /// headers - including the default configuration of MCP Inspector.
+    #[tokio::test]
+    async fn a_legacy_client_is_metered_from_its_body() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme")
+                .with_prices(PriceBook::flat(1).with_name("expensive", 25)),
+        );
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,
+                    "result":{"resultType":"complete","content":[]}
+                })))
+            }));
+
+        // No MCP-Protocol-Version, no Mcp-Method, no Mcp-Name: only a JSON-RPC body.
+        let legacy = Request::builder()
+            .header(crate::API_KEY_HEADER, "secret")
+            .body(Full::new(Bytes::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                       "params":{"name":"expensive"}})
+                .to_string(),
+            )))
+            .unwrap();
+
+        let response = service.oneshot(legacy).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        consume(response).await;
+        billing.flush().await.unwrap();
+        assert_eq!(
+            billing.exporter().exported()[0].units,
+            25,
+            "the body named the expensive tool, so the expensive price applies"
+        );
+    }
+
+    /// The trap the fallback opens if nobody looks: a legacy server answers without a
+    /// `resultType`, which the charge logic reads as unrecognized and bills as free.
+    /// Admitting legacy clients without this would have handed out unlimited free usage.
+    #[tokio::test]
+    async fn a_legacy_response_without_a_result_type_is_still_billed() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(7)),
+        );
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                // No resultType: exactly what a server answering a legacy client sends.
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"content":[]}
+                })))
+            }));
+
+        let legacy = Request::builder()
+            .header(crate::API_KEY_HEADER, "secret")
+            .body(Full::new(Bytes::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                       "params":{"name":"anything"}})
+                .to_string(),
+            )))
+            .unwrap();
+
+        let response = service.oneshot(legacy).await.unwrap();
+        consume(response).await;
+        billing.flush().await.unwrap();
+        assert_eq!(
+            billing.exporter().exported()[0].units,
+            7,
+            "a legacy result is delivered work and must be billed"
+        );
+    }
+
+    /// The same absence on a modern response must stay free: there it means the meter
+    /// did not understand the result, not that work was delivered.
+    #[tokio::test]
+    async fn a_modern_response_without_a_result_type_is_still_free() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(7)),
+        );
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"content":[]}
+                })))
+            }));
+
+        let response = service
+            .oneshot(request(
+                "tools/call",
+                Some("anything"),
+                &json!({"id":1,"params":{"name":"anything"}}),
+                "secret",
+            ))
+            .await
+            .unwrap();
+        consume(response).await;
+        billing.flush().await.unwrap();
+        assert!(
+            billing.exporter().exported().is_empty(),
+            "an unrecognized modern result must not be billed"
+        );
+    }
+
+    /// The reason pricing on a legacy body is safe, stated as a test: the name is read
+    /// from the document the origin executes. Claiming a cheap tool in the only place
+    /// the meter looks means calling the cheap tool.
+    #[tokio::test]
+    async fn a_legacy_client_cannot_underpay_by_lying_about_the_tool() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme")
+                .with_prices(PriceBook::flat(1).with_name("expensive", 25)),
+        );
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let seen: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let observed = seen.clone();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(move |request: Request<Full<Bytes>>| {
+                let observed = observed.clone();
+                async move {
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    *observed.lock().unwrap() =
+                        Some(body["params"]["name"].as_str().unwrap().into());
+                    Ok::<_, Infallible>(response(&json!({
+                        "jsonrpc":"2.0","id":1,
+                        "result":{"resultType":"complete","content":[]}
+                    })))
+                }
+            }));
+
+        // Mirrored headers claim the cheap call; the body asks for the expensive one.
+        // On a trusted revision the origin would reject the disagreement. Here the
+        // headers are ignored entirely, so the body decides both price and execution.
+        let lying = Request::builder()
+            .header(crate::API_KEY_HEADER, "secret")
+            .header(METHOD_HEADER, "tools/list")
+            .header(NAME_HEADER, "cheap")
+            .body(Full::new(Bytes::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                       "params":{"name":"expensive"}})
+                .to_string(),
+            )))
+            .unwrap();
+
+        let response = service.oneshot(lying).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        consume(response).await;
+        billing.flush().await.unwrap();
+        assert_eq!(
+            billing.exporter().exported()[0].units,
+            25,
+            "billed for what the origin ran, not what the headers claimed"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("expensive"),
+            "the origin ran the tool the body named"
+        );
+    }
+
+    /// Strict deployments keep the old behaviour.
+    #[tokio::test]
+    async fn strict_mode_still_refuses_legacy_clients() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let config = EdgeConfig::new(tenants).with_strict_protocol_version(true);
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                })))
+            }));
+
+        let legacy = Request::builder()
+            .header(crate::API_KEY_HEADER, "secret")
+            .body(Full::new(Bytes::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+            )))
+            .unwrap();
+        assert_eq!(
+            service.oneshot(legacy).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The fallback must not become a way to spend server CPU without a credential.
+    #[tokio::test]
+    async fn an_unauthenticated_legacy_request_is_refused_before_its_body_is_read() {
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let config = EdgeConfig::new(tenants);
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}
+                })))
+            }));
+
+        // Unparseable body, no credential: the credential gate must answer first.
+        let anonymous = Request::builder()
+            .body(Full::new(Bytes::from_static(b"{{{ not json")))
+            .unwrap();
+        assert_eq!(
+            service.oneshot(anonymous).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous caller must not reach the JSON parser"
+        );
+    }
+
     #[tokio::test]
     async fn complete_tool_call_is_recorded_after_body_consumption() {
         let tenants = Arc::new(InMemoryTenantStore::new());
@@ -2212,14 +2549,16 @@ mod tests {
         assert_eq!(unknown_key.status(), StatusCode::UNAUTHORIZED);
 
         // Classification runs before authentication, so this never reaches the
-        // credential gate and must land on the other counter.
-        let mut legacy = request("tools/list", None, &json!({"id":1,"params":{}}), "secret");
-        legacy.headers_mut().insert(
+        // credential gate and must land on the other counter. A malformed version is
+        // the case that still rejects on headers alone: a legacy one now falls back to
+        // the body instead.
+        let mut malformed = request("tools/list", None, &json!({"id":1,"params":{}}), "secret");
+        malformed.headers_mut().insert(
             PROTOCOL_VERSION_HEADER,
-            http::HeaderValue::from_static("2025-06-18"),
+            http::HeaderValue::from_static("not-a-date"),
         );
         assert_eq!(
-            service.oneshot(legacy).await.unwrap().status(),
+            service.oneshot(malformed).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
 
