@@ -18,8 +18,7 @@ cargo add mcp-usage-kit
 - `mcp-usage-core` - pure protocol classification, pricing, terminal-delivery,
   task-attribution, quota, and spend-cap decisions.
 - `mcp-usage-export` - synchronous usage recording, concurrent aggregation,
-  idempotent retry, a log exporter, and an optional Stripe Billing Meter Events
-  exporter.
+  idempotent retry, a log exporter, and a provider-neutral meter event exporter.
 - `mcp-usage-tower` - API-key authentication, mandatory header/version guards,
   authorization-aware caching, task attribution, SSE observation, metrics, and
   the generic Tower layer.
@@ -83,20 +82,23 @@ never change an MCP response. Cancellation and panic restore the in-progress
 batch through a drop guard. `LogExporter` is stateless and logging-only; use an
 application-owned exporter when exported batches must be captured.
 
-Enable the Stripe exporter with the `stripe` feature on `mcp-usage-export`. It
-submits pre-aggregated integer quantities to Stripe's Billing Meter Events API.
-Aggregates outside Stripe's accepted timestamp window and individual events
-synchronously rejected as permanently invalid enter a bounded dead letter queue
-without timestamp rewriting, while valid aggregates continue. After verifying
-and correlating Stripe's asynchronous failure events, applications can retain
-the original aggregate with `StripeExporter::quarantine_async_rejection`.
-Reconcile entries through `take_dead_letters` and alert on
-`dropped_dead_letters`.
-If a transient failure interrupts a batch after earlier events succeeded, the
-exporter resumes the identical retry batch after those confirmed events instead
-of submitting them again.
-The verified API contract and dashboard assumptions are recorded in
-[`docs/stripe-api-contract.md`](docs/stripe-api-contract.md).
+Implement `MeterEventProvider` for the billing service your application uses,
+then wrap it in `MeterEventExporter`. Providers receive unresolved aggregates in
+their original order and return one `MeterEventOutcome` per aggregate. Accepted
+and permanently rejected events are not resubmitted; retryable and ambiguous
+events keep their stable identifiers. Permanent rejections enter a bounded,
+identifier-deduplicated dead letter queue for application-owned reconciliation.
+Verified asynchronous rejections can enter the same queue through
+`quarantine_async_rejection`. Alert on `dropped_dead_letters` because a nonzero
+value means reconciliation data was discarded.
+
+Provider implementations own authentication, transport, wire encoding,
+timestamp acceptance, response classification, and asynchronous event
+verification. They must use stable aggregate identifiers for idempotency and use
+only static, low-cardinality codes with no secrets or customer data in outcomes
+and batch-wide errors. See
+[`docs/integration-contracts.md`](docs/integration-contracts.md) for the complete
+contract.
 
 ## Distributed task attribution
 

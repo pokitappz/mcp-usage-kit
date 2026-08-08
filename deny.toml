@@ -12,9 +12,9 @@
 #   cargo deny --all-features check
 
 [graph]
-# The interesting dependencies are all behind optional features: sqlx and redis
-# for the durable stores, reqwest for the Stripe exporter. Checking only default
-# features would leave the crates that actually reach the network unexamined.
+# The interesting dependencies are behind optional features: SQLx and Redis for
+# the durable stores. Checking only default features would leave the crates that
+# reach those network services unexamined.
 all-features = true
 
 [advisories]

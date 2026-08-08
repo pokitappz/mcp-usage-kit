@@ -7,6 +7,21 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the optional Stripe HTTP exporter with the always-available,
+  dependency-free `MeterEventProvider` and `MeterEventExporter` abstraction.
+  Providers return one ordered outcome per submitted aggregate. The exporter
+  retains partial retry progress, submits only unresolved events, and provides a
+  bounded reconciliation queue for synchronous and asynchronous rejections.
+
+### Removed
+
+- Removed the `stripe` Cargo features, `reqwest` dependency, `StripeExporter`,
+  `StripeDeadLetter`, and `StripeDeadLetterReason`. Provider implementations now
+  own authentication, transport, timestamp policy, response classification, and
+  wire encoding.
+
 ## [0.2.0] - 2026-08-01
 
 ### Added

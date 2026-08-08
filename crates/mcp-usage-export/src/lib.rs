@@ -20,6 +20,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use thiserror::Error;
 
+mod meter_event;
+
+pub use meter_event::{
+    MeterEventDeadLetter, MeterEventDeadLetterReason, MeterEventExporter, MeterEventOutcome,
+    MeterEventProvider, MeterEventProviderError, MeterEventProviderFuture,
+};
+
 /// Boxed future returned by object-safe billing exporters.
 pub type ExportFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ExportError>> + Send + 'a>>;
 
@@ -564,11 +571,6 @@ impl UsageRecorder for NoopRecorder {
 
 /// Convenient trait-object alias used by the edge layer.
 pub type SharedRecorder = Arc<dyn UsageRecorder>;
-
-#[cfg(feature = "stripe")]
-mod stripe;
-#[cfg(feature = "stripe")]
-pub use stripe::{StripeDeadLetter, StripeDeadLetterReason, StripeExporter};
 
 impl fmt::Display for RecordOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
