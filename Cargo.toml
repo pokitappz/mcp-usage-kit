@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -34,10 +34,10 @@ categories = ["asynchronous", "network-programming", "web-programming::http-serv
 # sentinel encoding). Nothing else. Async, HTTP, tower, and rmcp all belong to the
 # crates above it.
 [workspace.dependencies]
-mcp-usage-core = { version = "0.2.0", path = "crates/mcp-usage-core" }
-mcp-usage-export = { version = "0.2.0", path = "crates/mcp-usage-export" }
-mcp-usage-tower = { version = "0.2.0", path = "crates/mcp-usage-tower" }
-mcp-usage-store = { version = "0.2.0", path = "crates/mcp-usage-store" }
+mcp-usage-core = { version = "0.3.0", path = "crates/mcp-usage-core" }
+mcp-usage-export = { version = "0.3.0", path = "crates/mcp-usage-export" }
+mcp-usage-tower = { version = "0.3.0", path = "crates/mcp-usage-tower" }
+mcp-usage-store = { version = "0.3.0", path = "crates/mcp-usage-store" }
 
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
