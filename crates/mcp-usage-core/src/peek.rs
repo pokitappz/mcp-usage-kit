@@ -122,6 +122,27 @@ pub struct ResponsePeek {
 }
 
 impl ResponsePeek {
+    /// Read an absent `resultType` as delivered work, for a legacy request.
+    ///
+    /// `resultType` arrived with the interim-result machinery in
+    /// [`crate::version::HEADER_VALIDATION_SINCE`]. A server answering an older client
+    /// has no way to express "this is interim" and no reason to: on those revisions a
+    /// JSON-RPC `result` is the delivered work, full stop. Treating its absence as
+    /// unrecognized - correct for a modern response, where a missing discriminant means
+    /// something unparsed - would make every legacy call free.
+    ///
+    /// Apply this only when the request itself was classified as legacy. A modern
+    /// response missing its discriminant must stay unrecognized: there, absence means
+    /// the meter failed to understand the result, and guessing would bill for work that
+    /// may never have been delivered.
+    #[must_use]
+    pub fn with_legacy_delivery(mut self) -> Self {
+        if matches!(self.result_type, ResultType::Absent) && !self.is_error {
+            self.result_type = ResultType::Complete;
+        }
+        self
+    }
+
     /// A response carrying nothing the meter recognizes.
     #[must_use]
     pub const fn unrecognized() -> Self {

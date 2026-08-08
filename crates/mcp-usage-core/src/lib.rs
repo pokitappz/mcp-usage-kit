@@ -66,6 +66,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod charge;
+pub mod legacy;
 pub mod limits;
 pub mod method;
 pub mod name;
@@ -77,6 +78,7 @@ pub use charge::{
     Billable, Call, Charge, FreeReason, TaskAttribution, TaskOriginKind, decide,
     decide_with_task_attribution, decide_with_task_origin,
 };
+pub use legacy::{LegacyClassificationError, classify_body};
 pub use limits::{LimitDecision, LimitReason, Limits, Usage, assess_limits};
 pub use method::Method;
 pub use peek::{RequestPeek, ResponsePeek, ResultType, TaskPeek, TaskStatus};
