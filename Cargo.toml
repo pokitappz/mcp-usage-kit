@@ -41,7 +41,7 @@ mcp-usage-store = { version = "0.2.0", path = "crates/mcp-usage-store" }
 
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-base64 = "0.22.1"
+base64 = "0.23.0"
 axum = "0.8.9"
 bytes = "1.12.1"
 http = "1.4.0"
