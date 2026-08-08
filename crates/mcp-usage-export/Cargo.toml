@@ -15,12 +15,7 @@ readme = "README.md"
 [package.metadata.docs.rs]
 all-features = true
 
-[features]
-default = []
-stripe = ["dep:reqwest"]
-
 [dependencies]
-reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

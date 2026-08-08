@@ -20,7 +20,6 @@ default = []
 opentelemetry = ["mcp-usage-tower/opentelemetry"]
 postgres = ["dep:mcp-usage-store", "mcp-usage-store/postgres"]
 redis = ["dep:mcp-usage-store", "mcp-usage-store/redis"]
-stripe = ["mcp-usage-export/stripe"]
 
 [dependencies]
 mcp-usage-export = { workspace = true }

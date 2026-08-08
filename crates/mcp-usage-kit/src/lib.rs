@@ -41,11 +41,11 @@ pub use mcp_usage_core::{
 // from a re-exported item's signature is re-exported too.
 pub use mcp_usage_export::{
     AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, ExportError, ExportFuture,
-    FnExporter, LogExporter, NoopRecorder, RecordError, RecordOutcome, SharedExporter,
-    SharedRecorder, UsageBuffer, UsageEvent, UsageRecorder,
+    FnExporter, LogExporter, MeterEventDeadLetter, MeterEventDeadLetterReason, MeterEventExporter,
+    MeterEventOutcome, MeterEventProvider, MeterEventProviderError, MeterEventProviderFuture,
+    NoopRecorder, RecordError, RecordOutcome, SharedExporter, SharedRecorder, UsageBuffer,
+    UsageEvent, UsageRecorder,
 };
-#[cfg(feature = "stripe")]
-pub use mcp_usage_export::{StripeDeadLetter, StripeDeadLetterReason, StripeExporter};
 pub use mcp_usage_tower::{
     API_KEY_HEADER, DeferredCompletions, EdgeConfig, EdgeConfigError, EdgeMetrics,
     InMemoryTaskStore, InMemoryTenantStore, METHOD_HEADER, MIN_API_KEY_BYTES, MeterBody,

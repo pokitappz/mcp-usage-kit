@@ -1,9 +1,9 @@
 //! The price book: how many billable units a delivered call is worth.
 //!
 //! Units are integers, not currency. Converting units to money is the billing
-//! provider's job (Stripe meters, Paddle, an invoice line), and keeping money out
-//! of this crate keeps rounding, currency, and tax out of the attribution engine
-//! where they would only cause trouble.
+//! provider's job (meter events, an invoice line, or another billing API), and
+//! keeping money out of this crate keeps rounding, currency, and tax out of the
+//! attribution engine where they would only cause trouble.
 //!
 //! Pricing is keyed on the value of `Mcp-Name`, which covers a tool name, a
 //! prompt name, or a resource URI depending on the method. One map therefore

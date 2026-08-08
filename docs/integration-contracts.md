@@ -57,28 +57,49 @@ major version or wire format.
 - References: [OpenTelemetry Rust status](https://opentelemetry.io/docs/languages/rust/),
   [`Meter` API](https://docs.rs/opentelemetry/0.32.0/opentelemetry/metrics/struct.Meter.html).
 
-## Stripe
+## Meter event providers
 
-The verified Meter Events HTTP contract, authentication format, retry identity,
-endpoint restrictions, and dashboard-only setup are documented separately in
-[`stripe-api-contract.md`](stripe-api-contract.md).
+`MeterEventProvider::submit` receives a batch of unresolved `AggregatedUsage`
+values in original order. It returns exactly one ordered `MeterEventOutcome` per
+submitted aggregate, or one `MeterEventProviderError` when no per-event outcome
+is available. A wrong outcome count is treated as a batch-wide failure and no
+returned outcomes are applied.
 
-Aggregates outside Stripe's timestamp window and events synchronously rejected
-as permanently invalid are never retried with rewritten timestamps. They enter
-a bounded, identifier-deduplicated dead letter queue for application-owned
-reconciliation while valid aggregates in the same batch continue exporting.
-Transport failures, authentication failures, rate limits, external dependency
-failures, and server errors remain retryable with their original identifiers.
+Providers own authentication, endpoint selection, transport security, request
+encoding, timestamp validation, response classification, and any asynchronous
+notification receiver. They must use `AggregatedUsage::identifier` as the
+provider-side idempotency identity because cancellation, panic, timeout, and
+batch-wide failures can leave an accepted event ambiguous. Provider-specific
+timestamp windows or asynchronous acceptance semantics belong in the provider,
+not the generic exporter.
 
-Stripe processes Meter Events asynchronously and can report a rejection after
-the create request succeeds. The application owns the verified Stripe thin
-event receiver and source-record correlation. Once correlated, it passes the
-original aggregate to `StripeExporter::quarantine_async_rejection` so the same
-bounded reconciliation path covers both synchronous and asynchronous failures.
+Outcome and error codes must be static, low-cardinality categories with no
+credentials, customer data, event identifiers, URLs, response bodies, or other
+identifying values. `Accepted` and `PermanentRejection` complete an event.
+Permanent rejections enter a bounded reconciliation queue. `RetryableFailure`
+leaves an event unresolved and causes the full pipeline batch to remain pending.
 
-If a transient response interrupts a batch after earlier events received
-successful responses, the exporter retains process-local progress. Retrying the
-identical batch skips those confirmed events and resumes at the first unresolved
-event. A different batch is refused until the incomplete one finishes. The
-currently in-flight event may have an ambiguous outcome, so its stable Stripe
-identifier is reused.
+The exporter retains process-local partial progress and accepts only the
+identical original batch until all events complete or the application calls
+`abandon_retry_progress`. Retries submit only unresolved aggregates in original
+order. Applications may pass a verified and correlated late provider rejection
+to `quarantine_async_rejection` so synchronous and asynchronous rejection use
+the same bounded, identifier-deduplicated reconciliation queue.
+
+### Adapter shape
+
+A provider adapter normally maps each aggregate to its own request payload and
+keeps the stable `identifier` in that payload. A typical hosted meter payload
+carries an event name, customer identifier, integer value, timestamp, and
+idempotency identifier. The generic exporter does not construct that wire format
+or apply its timestamp rules. The adapter sends the payloads,
+preserves their order, and translates each response into one of:
+
+- `Accepted` when the provider confirms the event.
+- `RetryableFailure { code: "unavailable" }` when the event remains unresolved.
+- `PermanentRejection { code: "invalid_event" }` when only that event is invalid.
+
+If no per-event result exists, return a batch-wide
+`MeterEventProviderError::new("unavailable")`. The complete adapter example,
+including the boxed future shape, is in the
+[`mcp-usage-export` README](../crates/mcp-usage-export/README.md#provider-implementation-example).

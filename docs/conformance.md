@@ -2,8 +2,8 @@
 
 The versioned JSON vectors under
 [`crates/mcp-usage-core/conformance`](../crates/mcp-usage-core/conformance/v1/cases.json)
-define the observable accounting contract independently of Rust, Tower, Stripe,
-or any storage backend.
+define the observable accounting contract independently of Rust, Tower, any
+billing provider, or any storage backend.
 
 An implementation conforms to version 1 when it produces the expected verdict,
 unit quantity, free reason, and idempotency key for every vector. Implementations
