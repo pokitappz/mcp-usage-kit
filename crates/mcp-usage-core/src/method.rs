@@ -6,7 +6,6 @@
 //! against a small fixed set.
 //!
 //! Each classification maps to a billing or caching rule from the specification.
-//! See `docs/spec-2026-07-28-findings.md`.
 
 use std::fmt;
 

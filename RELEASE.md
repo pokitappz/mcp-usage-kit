@@ -31,8 +31,11 @@ Administration write permission.
 
 ## First release
 
-**As of v0.2.0 none of the five crates has been published**, so the next release
-is the first one and must take this path. Confirm with:
+**All five crates have been published since v0.3.0**, so this section no longer
+applies to an ordinary release; see "Later releases" below. It is kept for
+reference, and for any crate added to the workspace later, which would be
+unpublished and would need this path for its own first version. Confirm the
+current state with:
 
 ```sh
 for c in mcp-usage-core mcp-usage-export mcp-usage-tower mcp-usage-store mcp-usage-kit; do
