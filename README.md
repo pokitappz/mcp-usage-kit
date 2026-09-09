@@ -45,8 +45,8 @@ The meter records usage only after it observes a terminal result:
 
 The edge refuses to trust mirrored headers from a protocol revision older than
 2026-07-28. It also decodes the MCP Base64 name sentinel before looking up a
-price. See [`docs/spec-2026-07-28-findings.md`](docs/spec-2026-07-28-findings.md)
-for the wire-level reasoning and specification links.
+price. See the [MCP specification](https://modelcontextprotocol.io/specification)
+for the wire-level definitions these rules are derived from.
 
 ## Run the example
 

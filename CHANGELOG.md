@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-08
+
+### Changed
+
+- Updated dependencies to their current semver-compatible versions: `hyper`
+  1.11.1, `http-body-util` 0.1.5, `redis` 1.6.0, `rmcp` 3.2.0, `thiserror`
+  2.0.20, and `uuid` 1.26.0. No public API changed, and the minimum supported
+  Rust version stays at 1.88.
+- Moved the locked `chacha20` off 0.10.1, which upstream has since yanked, onto
+  0.10.2. It is reached only through `rand` and `rmcp`, both development
+  dependencies, so no published crate was affected.
+
+### Fixed
+
+- Removed references to a specification-findings document that no longer exists,
+  including a broken relative link in the README. The reasoning each reference
+  pointed at is now stated where it is needed.
+
 ## [0.3.0] - 2026-08-08
 
 ### Changed

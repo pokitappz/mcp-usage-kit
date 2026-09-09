@@ -22,8 +22,7 @@
 //!   of connecting.
 //!
 //! The fix is to stop counting requests. See [`charge`] for the rule and the
-//! reasoning; see `docs/spec-2026-07-28-findings.md` in the repository root for
-//! the specification citations behind every claim here.
+//! reasoning behind every claim here.
 //!
 //! # Shape of a call site
 //!
