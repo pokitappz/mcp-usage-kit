@@ -23,3 +23,6 @@ publish_with_retry mcp-usage-export
 publish_with_retry mcp-usage-tower
 publish_with_retry mcp-usage-store
 publish_with_retry mcp-usage-kit
+# The deployable sidecar, published so `cargo install mcp-usage-edge` works.
+# It depends on mcp-usage-kit, so it has to follow it in this order.
+publish_with_retry mcp-usage-edge

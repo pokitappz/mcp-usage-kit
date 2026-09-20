@@ -1,0 +1,96 @@
+# Metering sidecar configuration.
+#
+# Copy, edit, and pass as the single argument: `mcp-usage-edge edge.toml`.
+
+# Where agents connect. Point your MCP clients here instead of at the server.
+listen = "0.0.0.0:8080"
+
+[upstream]
+# Your unmodified MCP server, in whatever language it is written.
+url = "http://127.0.0.1:3000"
+# Generous, because a task-backed tool call legitimately takes minutes and a
+# premature timeout turns a billable completion into a free error.
+timeout_seconds = 300
+
+[edge]
+# Pass the caller's credential through to your server so its own auth keeps
+# working. Turn this off only if the sidecar fronts a server in a different
+# trust domain that should never see the caller's secret.
+credential_forwarding = true
+
+# Refuse clients older than MCP 2026-07-28 rather than parsing their body to
+# classify them. Off by default, because a client that predates the mirrored
+# headers gets a 400 rather than a slightly cheaper request. Turn it on only
+# once you know every client is current: it saves one JSON parse per request,
+# and header classification cannot be gamed the way an unvalidated legacy
+# request can.
+# strict_protocol_version = false
+
+# max_request_body_bytes = 1048576
+# max_response_capture_bytes = 1048576
+# meter_name = "mcp_units"
+
+# Ceiling on sustained credential guessing across the whole edge. Only
+# failures consume budget, so a caller with a valid key is never affected.
+# Worth setting on an internet-facing sidecar.
+# [edge.auth_failure_limit]
+# max_failures = 50
+# window_seconds = 60
+
+# [edge.cache]
+# max_entries = 1024
+# max_ttl_seconds = 60
+# public_sharing = false
+
+[exporter]
+# `log` writes aggregates as structured logs. It is the only exporter that
+# needs no credentials, and it is how you verify pricing before wiring billing.
+# `control-plane` posts them to the configured plane instead, and requires a
+# [control_plane] section.
+kind = "log"
+# How often the buffer drains. This bounds how much usage is in memory and
+# would be lost to a hard kill, so it is a durability knob, not a latency one.
+flush_interval_seconds = 10
+
+# ---------------------------------------------------------------------------
+# Tenant source: configure EXACTLY ONE of [[tenants]] below or [control_plane].
+# ---------------------------------------------------------------------------
+
+# A hosted control plane owns tenants, prices, limits and the authoritative
+# usage counters. The sidecar pulls a snapshot on an interval and keeps serving
+# from it while the plane is unreachable, so a plane outage costs freshness and
+# delayed invoicing rather than availability.
+#
+# [control_plane]
+# url = "https://plane.example.com"
+# token_env = "PLANE_EDGE_TOKEN"
+# refresh_interval_seconds = 30
+# # How long a snapshot keeps authenticating once refreshes start failing. Past
+# # this the sidecar fails closed, because serving hours-old revocations is
+# # worse than refusing. Must exceed the refresh interval, and should exceed it
+# # by a lot so an ordinary blip never reaches it.
+# max_stale_seconds = 900
+# timeout_seconds = 10
+# # Refuse calls from tenants already over quota. Resolution is one refresh
+# # interval: a tenant can overshoot by whatever it spends inside that window.
+# enforce_quota = true
+
+# One table per tenant. Keys are looked up by digest and never stored in plain
+# text at rest by the meter, but this file holds them, so prefer api_key_env.
+# Quota and spend caps are NOT available with a static table, because they need
+# authoritative counters that only a control plane has.
+[[tenants]]
+id = "acme"
+billing_customer_id = "cus_acme"
+api_key_env = "TENANT_ACME_KEY"
+
+# Units are integers, not currency. Turning units into money is the billing
+# provider's job.
+[tenants.prices]
+default_units = 1
+
+[tenants.prices.names]
+# Price by tool name, prompt name, or resource URI. Zero exposes a loss-leader
+# without carving it out of the billing path.
+expensive_enrichment = 50
+cheap_probe = 0
