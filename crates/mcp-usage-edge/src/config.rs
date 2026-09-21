@@ -77,6 +77,21 @@ pub enum ConfigError {
     /// A staleness budget that does not exceed the refresh interval.
     #[error("control_plane.max_stale_seconds must exceed refresh_interval_seconds")]
     StaleBudgetTooSmall,
+    /// An MPP secret or token variable is unset or empty.
+    #[error("MPP reads a secret from ${0}, which is unset or empty")]
+    MppSecretMissing(String),
+    /// `[mpp]` was configured without a control plane.
+    #[error(
+        "[mpp] requires [control_plane]: a challenge is offered when a tenant is over quota, \
+         and quota needs the authoritative counters only a control plane has"
+    )]
+    MppWithoutPlane,
+    /// `mpp.facilitator.url` is not usable.
+    #[error("mpp.facilitator.url must be an absolute https URL, got {0:?}")]
+    FacilitatorUrl(String),
+    /// A zero-length challenge lifetime.
+    #[error("mpp.challenge_ttl_seconds must be greater than zero")]
+    ZeroChallengeTtl,
 }
 
 /// A parsed sidecar configuration.
@@ -99,6 +114,114 @@ pub struct Config {
     /// Hosted control plane. Mutually exclusive with `tenants`.
     #[serde(default)]
     pub control_plane: Option<ControlPlaneSettings>,
+    /// Accept MPP payment instead of refusing an over-quota call.
+    #[serde(default)]
+    pub mpp: Option<MppSettings>,
+}
+
+/// The "Payment" HTTP authentication scheme, as this sidecar offers it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MppSettings {
+    /// Protection space advertised in the challenge.
+    pub realm: String,
+    /// Lowercase payment method identifier, such as `tempo` or `usdc`.
+    pub method: String,
+    /// Registered intent. `charge` is a one-time payment that settles now.
+    #[serde(default = "default_intent")]
+    pub intent: String,
+    /// ISO 4217 code, lowercase.
+    pub currency: String,
+    /// Who is paid. Interpreted by the payment method.
+    pub recipient: String,
+    /// Environment variable holding the challenge-binding secret.
+    pub secret_env: String,
+    /// How long a challenge stays answerable.
+    #[serde(default = "default_challenge_ttl_seconds")]
+    pub challenge_ttl_seconds: u64,
+    /// How many spent proofs to remember.
+    #[serde(default = "default_replay_capacity")]
+    pub replay_capacity: usize,
+    /// Where proofs are verified.
+    pub facilitator: FacilitatorSettings,
+}
+
+/// The service that answers whether a proof settled.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacilitatorSettings {
+    /// Absolute URL of the verification endpoint.
+    pub url: String,
+    /// Environment variable holding a bearer token for it, when it needs one.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// How long to wait for a verdict.
+    #[serde(default = "default_facilitator_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_intent() -> String {
+    "charge".to_owned()
+}
+
+const fn default_challenge_ttl_seconds() -> u64 {
+    300
+}
+
+const fn default_replay_capacity() -> usize {
+    100_000
+}
+
+const fn default_facilitator_timeout_seconds() -> u64 {
+    20
+}
+
+impl MppSettings {
+    /// How long a challenge stays answerable.
+    #[must_use]
+    pub const fn challenge_ttl(&self) -> Duration {
+        Duration::from_secs(self.challenge_ttl_seconds)
+    }
+
+    /// Resolve the challenge-binding secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MppSecretMissing`] when the variable is unset or
+    /// empty. There is no default: an unbound or predictably bound challenge
+    /// lets an agent mint its own and set its own price.
+    pub fn secret(&self) -> Result<Vec<u8>, ConfigError> {
+        std::env::var(&self.secret_env)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(String::into_bytes)
+            .ok_or_else(|| ConfigError::MppSecretMissing(self.secret_env.clone()))
+    }
+}
+
+impl FacilitatorSettings {
+    /// How long to wait for a verdict.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_seconds)
+    }
+
+    /// Resolve the facilitator bearer token, when one is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::MppSecretMissing`] when a variable is named but
+    /// unset, which is a configuration mistake rather than "no token".
+    pub fn token(&self) -> Result<Option<String>, ConfigError> {
+        let Some(name) = &self.token_env else {
+            return Ok(None);
+        };
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(Some)
+            .ok_or_else(|| ConfigError::MppSecretMissing(name.clone()))
+    }
 }
 
 /// The MCP server this sidecar fronts.
@@ -446,6 +569,36 @@ impl Config {
             }
         } else if self.exporter.kind == ExporterKind::ControlPlane {
             return Err(ConfigError::ExporterWithoutPlane);
+        }
+
+        if let Some(mpp) = &self.mpp {
+            // A challenge is only ever issued when a tenant is refused, and
+            // only quota refuses. Without a plane the gate never refuses, so
+            // the section would silently do nothing.
+            if self.control_plane.is_none() {
+                return Err(ConfigError::MppWithoutPlane);
+            }
+            if mpp.challenge_ttl_seconds == 0 {
+                return Err(ConfigError::ZeroChallengeTtl);
+            }
+            let uri: http::Uri = mpp
+                .facilitator
+                .url
+                .parse()
+                .map_err(|_| ConfigError::FacilitatorUrl(mpp.facilitator.url.clone()))?;
+            let loopback = uri
+                .host()
+                .and_then(|host| {
+                    host.trim_matches(|c| c == '[' || c == ']')
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                })
+                .is_some_and(|address| address.is_loopback());
+            // A facilitator sees payment proofs, so plaintext is only ever
+            // acceptable to a loopback test server.
+            if uri.host().is_none() || (uri.scheme_str() != Some("https") && !loopback) {
+                return Err(ConfigError::FacilitatorUrl(mpp.facilitator.url.clone()));
+            }
         }
         Ok(())
     }

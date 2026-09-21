@@ -308,6 +308,19 @@ impl ControlPlaneTenantStore {
             .is_none_or(|at| at.elapsed() > self.max_stale)
     }
 
+    /// The cached tenant for a presented key, without the staleness check.
+    ///
+    /// For pricing a payment challenge, where the caller has already decided
+    /// the request is being refused and only needs the price book. Admission
+    /// itself goes through [`Self::quota_for`], which does check staleness.
+    #[must_use]
+    pub fn tenant_for(&self, api_key: &str) -> Option<Tenant> {
+        self.read()
+            .entries
+            .get(&hash_api_key(api_key))
+            .map(|cached| cached.tenant.clone())
+    }
+
     /// The limits, committed usage and unit price for a presented key.
     ///
     /// Returns `None` for an unknown key or a stale cache, which the quota gate
