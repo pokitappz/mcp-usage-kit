@@ -9,6 +9,14 @@ members = [
     "crates/mcp-usage-edge",
 ]
 
+# The Python extension is deliberately NOT a workspace member. With PyO3's
+# `extension-module` feature the cdylib does not link libpython, which is what
+# makes a wheel portable but also what makes `cargo test` on it fail to link.
+# Keeping it out means `cargo test --workspace --all-features` stays honest,
+# and the binding is proven the only way that actually matters: by running the
+# shared conformance vectors from Python.
+exclude = ["bindings/python"]
+
 [workspace.package]
 version = "0.3.1"
 edition = "2024"

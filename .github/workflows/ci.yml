@@ -51,6 +51,48 @@ jobs:
             exit 1
           fi
 
+  python:
+    name: Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      # The binding is excluded from the workspace, so the quality job above
+      # does not reach it. It gets the same two gates here.
+      - name: Check formatting
+        working-directory: bindings/python
+        run: cargo +stable fmt --all -- --check
+      - name: Lint
+        working-directory: bindings/python
+        run: cargo +stable clippy --all-targets --locked -- -D warnings
+      # `cargo metadata --no-deps` cannot see an excluded package, so the
+      # release guard does not cover the binding's version. Checked here
+      # instead, or a release would ship an engine and a binding that disagree
+      # about what version they are.
+      - name: Check the binding version matches the workspace
+        run: |
+          workspace="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          binding="$(cargo metadata --no-deps --format-version 1 \
+            --manifest-path bindings/python/Cargo.toml | jq -r '.packages[0].version')"
+          if [ "$workspace" != "$binding" ]; then
+            echo "binding is $binding but the workspace is $workspace" >&2
+            exit 1
+          fi
+      - name: Install build and test tooling
+        run: python3 -m pip install --upgrade 'maturin>=1.9,<2.0' pytest
+      - name: Build the extension
+        working-directory: bindings/python
+        run: maturin build --release --out dist
+      - name: Install the built wheel
+        working-directory: bindings/python
+        run: python3 -m pip install --no-index --find-links dist mcp-usage-kit
+      # The point of the binding: the same vectors the Rust reference test
+      # runs, executed from Python against the built wheel.
+      - name: Run the shared conformance vectors and the API suite
+        working-directory: bindings/python
+        run: python3 -m pytest tests/ -q
+
   msrv:
     name: Rust 1.88 minimum version
     runs-on: ubuntu-latest

@@ -1,0 +1,8 @@
+# maturin build output
+/dist
+/target
+
+# Python
+__pycache__/
+*.so
+.pytest_cache/
