@@ -19,12 +19,13 @@ use mcp_usage_kit::{
 use tokio::net::TcpListener;
 use tower::Layer;
 
+use mcp_usage_edge::admission::AdmissionLayer;
 use mcp_usage_edge::config::{Config, ExporterKind};
 use mcp_usage_edge::control_plane::{
     ControlPlaneExporter, ControlPlaneTenantStore, PlaneClient, refresh_forever,
 };
-use mcp_usage_edge::proxy::{UpstreamProxy, build_client};
-use mcp_usage_edge::quota::QuotaLayer;
+use mcp_usage_edge::mpp::{FacilitatorMethod, Payments, PaymentsConfig};
+use mcp_usage_edge::proxy::{HttpsClient, UpstreamProxy, build_client};
 
 const USAGE: &str = "usage: mcp-usage-edge <config.toml>";
 
@@ -144,6 +145,60 @@ fn edge_config(
     Ok(edge)
 }
 
+/// Assemble the admission gate from configuration.
+///
+/// Quota and payments are independent: either, both, or neither. The layer is
+/// always present so the sidecar has one service type regardless.
+fn admission_gate(
+    config: &Config,
+    cached: Option<&Arc<ControlPlaneTenantStore>>,
+    http: &HttpsClient,
+) -> Result<AdmissionLayer, Box<dyn std::error::Error>> {
+    let mut gate = AdmissionLayer::disabled();
+
+    let enforce_quota = config
+        .control_plane
+        .as_ref()
+        .is_some_and(|settings| settings.enforce_quota);
+    if let (Some(store), true) = (cached, enforce_quota) {
+        gate = gate.with_quota(store.clone());
+    }
+
+    if let Some(settings) = &config.mpp {
+        let method = FacilitatorMethod::new(
+            http.clone(),
+            settings.method.clone(),
+            settings.facilitator.url.clone(),
+            settings.facilitator.token()?,
+            settings.facilitator.timeout(),
+        );
+        let payments = Payments::new(
+            PaymentsConfig {
+                secret: settings.secret()?,
+                realm: settings.realm.clone(),
+                intent: settings.intent.clone(),
+                currency: settings.currency.clone(),
+                recipient: settings.recipient.clone(),
+                ttl: settings.challenge_ttl(),
+                replay_capacity: settings.replay_capacity,
+            },
+            Box::new(method),
+        );
+        tracing::info!(
+            method = %settings.method,
+            realm = %settings.realm,
+            intent = %settings.intent,
+            "MPP payments enabled; an over-quota call is priced rather than refused"
+        );
+        gate = gate.with_payments(Arc::new(payments));
+    }
+
+    if let Some(bytes) = config.edge.max_request_body_bytes {
+        gate = gate.with_max_body(bytes);
+    }
+    Ok(gate)
+}
+
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "tls")]
     install_crypto_provider();
@@ -192,18 +247,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let enforce_quota = config
-        .control_plane
-        .as_ref()
-        .is_some_and(|settings| settings.enforce_quota);
-    let gate = match (&cached, enforce_quota) {
-        (Some(store), true) => QuotaLayer::new(store.clone()),
-        // Quota needs authoritative counters, which a statically configured
-        // sidecar does not have.
-        _ => QuotaLayer::disabled(),
-    };
+    let gate = admission_gate(&config, cached.as_ref(), &http)?;
 
-    let proxy = UpstreamProxy::with_client(http, &config.upstream.url, config.upstream.timeout())?;
+    let proxy = UpstreamProxy::with_client(
+        http.clone(),
+        &config.upstream.url,
+        config.upstream.timeout(),
+    )?;
     let service = gate.layer(MeterLayer::new(edge).layer(proxy));
 
     let listener = TcpListener::bind(config.listen).await?;

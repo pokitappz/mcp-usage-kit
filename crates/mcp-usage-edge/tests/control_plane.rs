@@ -18,11 +18,11 @@ use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use mcp_usage_edge::admission::AdmissionLayer;
 use mcp_usage_edge::control_plane::{
     ControlPlaneExporter, ControlPlaneTenantStore, PlaneClient, refresh_forever,
 };
 use mcp_usage_edge::proxy::{UpstreamProxy, build_client};
-use mcp_usage_edge::quota::QuotaLayer;
 use mcp_usage_kit::{BillingPipeline, EdgeConfig, MeterEventExporter, MeterLayer, hash_api_key};
 use tokio::net::TcpListener;
 use tower::Layer;
@@ -225,9 +225,9 @@ async fn harness(max_stale: Duration, refresh: Duration, enforce_quota: bool) ->
         UpstreamProxy::with_client(http, &format!("http://{upstream}"), Duration::from_secs(5))
             .expect("proxy");
     let gate = if enforce_quota {
-        QuotaLayer::new(store.clone())
+        AdmissionLayer::disabled().with_quota(store.clone())
     } else {
-        QuotaLayer::disabled()
+        AdmissionLayer::disabled()
     };
     let service = gate.layer(MeterLayer::new(edge).layer(proxy));
 
