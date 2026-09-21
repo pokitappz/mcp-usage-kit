@@ -116,10 +116,92 @@ HTTP/1.1 429 Too Many Requests
 {"error":"quota_exceeded","retryable":false}
 ```
 
+## Accepting payment instead of refusing (MPP)
+
+With an `[mpp]` section an over-quota call is *priced* rather than refused. The
+sidecar answers `402 Payment Required` with a `WWW-Authenticate: Payment`
+challenge, the agent pays, retries, and gets the call plus a `Payment-Receipt`.
+
+This is the "Payment" HTTP authentication scheme from
+[draft-ryan-httpauth-payment-01](https://datatracker.ietf.org/doc/html/draft-ryan-httpauth-payment-01),
+which is what MPP is built on. It is an *inbound* protocol: there is nothing to
+export to and no discovery step before the 402, which is why it lives at the
+edge rather than in a control plane.
+
+```
+agent -> sidecar                     402 + WWW-Authenticate: Payment
+                                          Cache-Control: no-store
+                                          application/problem+json
+agent pays out of band
+agent -> sidecar  Payment-Authorization: Payment <base64url>
+                                     200 + Payment-Receipt: <base64url>
+```
+
+The credential arrives in `Payment-Authorization`, not `Authorization`. The
+draft's optional `header` parameter exists for exactly this, and the sidecar
+always uses it: `Authorization` already carries the tenant's own bearer key on
+its way to the upstream, and overwriting it would break the customer's
+authentication in order to fund a payment.
+
+### What is checked before anything settles
+
+| Check | Why |
+|---|---|
+| HMAC binding over every challenge parameter | Otherwise an agent mints its own challenge and sets its own price |
+| `realm` and `method` match this server | A credential for someone else is not payment here |
+| `expires` | A challenge is time-bound |
+| RFC 9530 body digest | Binds a credential to the exact call it paid for, so it cannot be moved to a more expensive one |
+| Single-use claim | The draft requires a proof be spendable exactly once, and concurrent presentations settle at most once |
+
+Only then is the payment method consulted. Each check maps to a registered
+problem type under `https://paymentauth.org/problems/`, so an agent branches on
+a URI rather than parsing prose.
+
+### Verification
+
+The scheme is method-agnostic and leaves verification to each payment method's
+own specification, against its own network. The sidecar therefore asks a
+facilitator: one service that holds the network credentials and answers whether
+a proof settled and for how much.
+
+**The facilitator request and response shape is this sidecar's own contract, not
+part of MPP**, which does not define one. It is deliberately small so fronting
+an existing facilitator is a thin adapter:
+
+```json
+POST <url>
+{"method":"tempo","intent":"charge","challenge_id":"...","source":"did:...",
+ "request":{"amount":"1000","currency":"usd","recipient":"acct_123"},
+ "payload":{ ...method-specific proof... }}
+
+200 {"settled":true,"reference":"0xabc..."}
+200 {"settled":false,"reason":"insufficient"}
+```
+
+A facilitator that times out, is unreachable, or answers anything else leaves
+the payment unproven and the call refused. Failing open would make an outage at
+the facilitator a free-service coupon.
+
+Implementing a method natively instead means implementing that method's spec
+against its settlement layer and supplying a `PaymentMethod`.
+
+### Pricing
+
+A challenge is priced from the tenant's own price book: the units the call would
+be metered at, times the tenant's unit price, converted to the currency's minor
+unit and **rounded up**. Serving below cost is the worse failure.
+
+Payment is about admission only. Once admitted, a paid call is ordinary traffic
+and is metered exactly like a prepaid one.
+
 ## What it does not do
 
 - **No quota without a plane.** A statically configured sidecar has no
-  authoritative counters, so the gate is disabled and admits everything.
+  authoritative counters, so the gate is disabled and admits everything. The
+  same applies to `[mpp]`, which is refused without `[control_plane]`.
+- **Single-instance replay protection.** Spent proofs are remembered in
+  process. A horizontally scaled deployment needs a shared store, the same way
+  durable task attribution does.
 - **No in-process context.** The sidecar sees the MCP wire protocol and nothing
   else. An application that wants to price on its own internal state should
   embed `mcp-usage-kit` directly.

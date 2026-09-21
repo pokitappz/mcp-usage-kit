@@ -75,6 +75,31 @@ flush_interval_seconds = 10
 # # interval: a tenant can overshoot by whatever it spends inside that window.
 # enforce_quota = true
 
+# Accept payment instead of refusing an over-quota call, using the "Payment"
+# HTTP authentication scheme (MPP). Requires [control_plane], because a
+# challenge is only ever issued when a tenant is refused and only quota
+# refuses.
+#
+# [mpp]
+# realm = "mcp.example.com"
+# method = "tempo"            # lowercase payment method identifier
+# intent = "charge"           # one-time payment that settles immediately
+# currency = "usd"
+# recipient = "acct_merchant"
+# # No default: an unbound or predictably bound challenge lets an agent mint
+# # its own and set its own price. Generate with `openssl rand -base64 32`.
+# secret_env = "MPP_CHALLENGE_SECRET"
+# challenge_ttl_seconds = 300
+# replay_capacity = 100000
+#
+# # Where a proof is verified. The scheme leaves verification to each payment
+# # method against its own network, so the sidecar asks a service that holds
+# # those credentials.
+# [mpp.facilitator]
+# url = "https://facilitator.example.com/verify"
+# token_env = "MPP_FACILITATOR_TOKEN"
+# timeout_seconds = 20
+
 # One table per tenant. Keys are looked up by digest and never stored in plain
 # text at rest by the meter, but this file holds them, so prefer api_key_env.
 # Quota and spend caps are NOT available with a static table, because they need
