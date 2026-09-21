@@ -27,8 +27,11 @@ tls = ["dep:hyper-rustls", "dep:rustls"]
 
 [dependencies]
 mcp-usage-kit = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 # `client-legacy` is the pooled client that already implements
@@ -37,6 +40,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -47,4 +51,3 @@ hyper-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
-http-body = { workspace = true }
