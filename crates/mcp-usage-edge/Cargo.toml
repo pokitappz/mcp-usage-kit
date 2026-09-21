@@ -1,0 +1,50 @@
+[package]
+name = "mcp-usage-edge"
+description = "Metering sidecar that fronts an MCP server written in any language."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+# This crate is a deployable binary, not a library dependency, so it is the one
+# place in the workspace that may pull in a client stack, TLS, and config
+# parsing. Keeping those out of the library crates is what lets an application
+# embed `mcp-usage-kit` without inheriting a transitive HTTP client.
+[[bin]]
+name = "mcp-usage-edge"
+path = "src/main.rs"
+
+[features]
+default = ["tls"]
+# Upstreams reached over https. Off by default in tests and for sidecars that
+# talk to a loopback or private-network upstream, which is the common shape.
+tls = ["dep:hyper-rustls", "dep:rustls"]
+
+[dependencies]
+mcp-usage-kit = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+# `client-legacy` is the pooled client that already implements
+# `tower::Service<Request<B>, Response = Response<Incoming>>`, which is exactly
+# the bound `MeterService` puts on its inner service. Nothing has to adapt.
+hyper-util = { workspace = true, features = ["client-legacy"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hyper-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+http-body = { workspace = true }

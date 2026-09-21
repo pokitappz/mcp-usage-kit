@@ -1,0 +1,33 @@
+# Deploy from the workspace root:
+#   fly deploy -c crates/mcp-usage-edge/fly.toml --dockerfile crates/mcp-usage-edge/Dockerfile
+#
+# Tenant keys are secrets, never config:
+#   fly secrets set TENANT_ACME_KEY="$(openssl rand -base64 32)"
+
+app = 'mcp-usage-edge'
+primary_region = 'yyz'
+
+[build]
+
+# Default is 5s. Gives the shutdown path in src/main.rs room to run its final
+# flush, so usage already recorded is exported instead of being SIGKILLed away.
+kill_timeout = '15s'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Never auto-stop a meter: a stopped machine cannot flush buffered usage, and
+  # a cold start in front of an MCP call costs the caller latency.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [http_service.concurrency]
+    type = 'requests'
+    soft_limit = 64
+    hard_limit = 128
+
+[[vm]]
+  memory = '512mb'
+  cpus = 1
