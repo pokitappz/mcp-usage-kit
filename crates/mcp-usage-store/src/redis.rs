@@ -29,6 +29,10 @@ impl std::fmt::Debug for RedisTaskStore {
 impl RedisTaskStore {
     /// Connect with a reconnecting, multiplexed async connection manager.
     ///
+    /// `ttl` must outlive the longest task the upstream server can run, not
+    /// the client's polling interval. A task that outlives it bills zero. See
+    /// the [crate-level notes](crate#choosing-a-ttl).
+    ///
     /// # Errors
     ///
     /// Returns a sanitized error for invalid configuration or connection

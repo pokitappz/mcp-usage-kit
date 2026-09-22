@@ -851,8 +851,8 @@ impl Completion {
                     }
                 }
             }
-            Charge::Free(_) => {
-                self.config.metrics.free();
+            Charge::Free(reason) => {
+                self.config.metrics.free(reason);
                 // The claim above already deleted the attribution, on the
                 // assumption that a completed task bills. Some shapes do not:
                 // a `tasks/get` answering with `resultType: "task"` reads as
@@ -1142,7 +1142,7 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use crate::{InMemoryTenantStore, Tenant};
-    use mcp_usage_core::PriceBook;
+    use mcp_usage_core::{FreeReason, PriceBook};
     use mcp_usage_export::{
         AggregatedUsage, BatchExporter, BillingPipeline, ExportFuture, RecordError, UsageRecorder,
     };
@@ -1813,6 +1813,69 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.billed, 1);
         assert_eq!(snapshot.billed_units, 50);
+    }
+
+    #[tokio::test]
+    async fn free_verdicts_reach_the_metrics_under_their_own_reason() {
+        // The layer used to throw the reason away, which is the one thing the
+        // enum exists to carry. Discovery traffic is normal; a completed task
+        // that cannot be joined to its origin is lost revenue. Collapsed into
+        // a single `free` counter the two are indistinguishable, so an
+        // operator watching the dashboard cannot see the second happening.
+        let config = EdgeConfig::new(task_tenants());
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async move {
+                Ok::<_, Infallible>(response(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "resultType": "complete",
+                        "taskId": "task-unknown",
+                        "status": "completed",
+                        "content": []
+                    }
+                })))
+            }));
+
+        // Discovery: free, and unremarkable.
+        consume(
+            service
+                .clone()
+                .oneshot(request("tools/list", None, &json!({"id":1}), "secret"))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // A completed task nobody claimed: free, and a lost charge.
+        consume(
+            service
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":2,"params":{"taskId":"task-unknown"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 0);
+        assert_eq!(snapshot.free, 2);
+        assert_eq!(
+            snapshot.free_by_reason[FreeReason::Discovery.index()],
+            1,
+            "the listing must land under discovery"
+        );
+        assert_eq!(
+            snapshot.free_by_reason[FreeReason::MissingTaskAttribution.index()],
+            1,
+            "the orphaned completion must be separable from discovery"
+        );
     }
 
     #[tokio::test]

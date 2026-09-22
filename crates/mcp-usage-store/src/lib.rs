@@ -5,6 +5,35 @@
 //! resolved when the task was created, never a name, URI, or extension method
 //! string. Inserts are first-writer-wins and claims are atomic, so a completed
 //! task can be accounted for by at most one application instance.
+//!
+//! # Choosing a TTL
+//!
+//! **The TTL must outlive the longest task the upstream server can run.** It is
+//! the deadline on the whole task, not on the polling interval: the attribution
+//! is written when the task is created and read when it completes, so a task
+//! that takes longer than the TTL loses the price resolved at creation.
+//!
+//! Nothing fails loudly when that happens. The completing poll finds no
+//! attribution, classifies as [`FreeReason::MissingTaskAttribution`], and the
+//! call bills zero. From the customer's side the work was delivered and never
+//! charged, so the symptom is silent under-billing that scales with how long
+//! tasks run. Watch `mcp_usage_free_deliveries_by_reason_total{reason=
+//! "missing_task_attribution"}`: a nonzero rate on a server that issues durable
+//! tasks is the signal that this TTL is too short.
+//!
+//! Set it from the upstream's own task timeout with headroom, not from a guess
+//! about client behaviour. Over-provisioning is cheap - rows are 10 bytes of
+//! value behind two 32-byte digests, and expiry reclaims them - while
+//! under-provisioning loses revenue.
+//!
+//! A per-task TTL would remove the guess, since the creating call knows what it
+//! commissioned. It is not available yet: [`TaskAttribution`] carries only the
+//! origin category and the resolved units, and
+//! [`TaskAttributionStore::insert`] takes no deadline, so expressing one is a
+//! breaking change to that trait rather than a change inside these backends.
+//!
+//! [`FreeReason::MissingTaskAttribution`]: mcp_usage_core::FreeReason::MissingTaskAttribution
+//! [`TaskAttributionStore::insert`]: mcp_usage_tower::TaskAttributionStore::insert
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::pedantic)]

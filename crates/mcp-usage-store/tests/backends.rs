@@ -355,6 +355,67 @@ mod postgres_backend {
         Some(store)
     }
 
+    /// An attribution priced at `units`, so two of them are distinguishable.
+    fn priced(units: u64) -> TaskAttribution {
+        TaskAttribution::from_call(
+            &Call::new(Method::ToolsCall, Some("job".to_owned())),
+            &PriceBook::flat(units),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_task_id_is_storable_again_once_its_attribution_expires() {
+        // Every read filters on `expires_at`, so an expired row is invisible
+        // to `get` and `claim`. If it still wins the insert conflict, a task
+        // id reused after expiry is permanently unstorable and every
+        // completion of it bills nothing at all.
+        // One second is the shortest TTL the store accepts, so the row is
+        // allowed to age out rather than being written pre-expired.
+        let Some(expiring) = connect(Duration::from_secs(1)).await else {
+            return;
+        };
+        let Some(live) = connect(Duration::from_secs(600)).await else {
+            return;
+        };
+        let task = unique("reused");
+
+        expiring
+            .insert("tenant", &task, priced(7))
+            .await
+            .expect("first insert");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            expiring.get("tenant", &task).await.expect("get").is_none(),
+            "an expired attribution must not be served"
+        );
+
+        // The same id comes round again, as a task id eventually does.
+        live.insert("tenant", &task, priced(25))
+            .await
+            .expect("second insert");
+        let stored = live
+            .get("tenant", &task)
+            .await
+            .expect("get")
+            .expect("the reused id must be storable again");
+        assert_eq!(stored, priced(25));
+
+        // A live attribution is still first-writer-wins.
+        live.insert("tenant", &task, priced(99))
+            .await
+            .expect("third insert");
+        assert_eq!(
+            live.get("tenant", &task)
+                .await
+                .expect("get")
+                .expect("present"),
+            priced(25),
+            "a live attribution must not be overwritten"
+        );
+
+        live.remove("tenant", &task).await.expect("cleanup");
+    }
+
     #[tokio::test]
     async fn honors_the_task_store_contract() {
         let Some(store) = connect(Duration::from_secs(60)).await else {
