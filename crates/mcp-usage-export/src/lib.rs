@@ -247,6 +247,11 @@ struct BufferState {
     retry: Vec<AggregatedUsage>,
     seen: HashSet<(String, String)>,
     seen_order: VecDeque<(String, String)>,
+    /// Set when a retry batch comes back unexported, so the next flush serves
+    /// fresh usage instead. Without it a batch the provider will never accept
+    /// is re-offered on every flush forever and no other customer's usage is
+    /// ever exported again.
+    serve_pending_next: bool,
 }
 
 /// Thread-safe in-memory aggregator with bounded idempotency memory.
@@ -351,9 +356,21 @@ impl UsageBuffer {
 
     fn prepare_flush(&self) -> Result<Vec<AggregatedUsage>, RecordError> {
         let mut state = self.lock()?;
-        if !state.retry.is_empty() {
+
+        // A retry goes first, because its identifiers are already known to the
+        // provider and delaying it delays an invoice. But it does not go first
+        // *every* time: a batch the provider will never accept would otherwise
+        // be re-offered on every flush forever, and every other customer's
+        // usage would sit behind it until the process died and took the whole
+        // buffer with it. After a failure the next flush serves fresh usage,
+        // so a stuck batch delays itself rather than everyone.
+        let take_retry =
+            !state.retry.is_empty() && (!state.serve_pending_next || state.pending.is_empty());
+        if take_retry {
+            state.serve_pending_next = false;
             return Ok(std::mem::take(&mut state.retry));
         }
+        state.serve_pending_next = false;
         let mut batch: Vec<_> = std::mem::take(&mut state.pending)
             .into_iter()
             .map(|(key, aggregate)| AggregatedUsage {
@@ -382,6 +399,21 @@ impl UsageBuffer {
         } else {
             state.retry.extend(batch);
         }
+        state.serve_pending_next = true;
+    }
+
+    /// Number of aggregates waiting to be retried.
+    ///
+    /// Separated from [`Self::pending_buckets`] because the two mean very
+    /// different things operationally: pending rising means traffic, retry
+    /// rising means the provider is refusing, and a retry count that never
+    /// falls is a batch that will never be accepted.
+    #[must_use]
+    pub fn retry_buckets(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.retry.len())
+            .unwrap_or_default()
     }
 
     /// Number of live aggregate buckets plus retry events.
@@ -439,6 +471,15 @@ impl<E> BillingPipeline<E> {
     #[must_use]
     pub fn pending_buckets(&self) -> usize {
         self.buffer.pending_buckets()
+    }
+
+    /// Number of aggregates waiting to be retried.
+    ///
+    /// Worth alerting on: a count that never falls is usage the provider keeps
+    /// refusing, and the buffer is in memory, so it is lost at the next deploy.
+    #[must_use]
+    pub fn retry_buckets(&self) -> usize {
+        self.buffer.retry_buckets()
     }
 
     /// Access the exporter for diagnostics and tests.

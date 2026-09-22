@@ -116,12 +116,56 @@ fn tenant_source(
 ///
 /// Every knob the library exposes through a builder is a named field in the
 /// file, so this is a straight transcription with no defaulting of its own.
+/// Connect the shared task store, when one is configured.
+///
+/// Without it the default store is process-local: a durable task created on
+/// one instance and completed on another finds no attribution, and the
+/// completing poll bills nothing at all.
+#[cfg(feature = "redis")]
+async fn task_store(
+    config: &Config,
+) -> Result<Option<Arc<dyn mcp_usage_kit::TaskAttributionStore>>, Box<dyn std::error::Error>> {
+    let Some(settings) = &config.task_store else {
+        return Ok(None);
+    };
+    let store = mcp_usage_kit::store::RedisTaskStore::connect_with_timeout(
+        &settings.url()?,
+        settings.key_prefix.clone(),
+        settings.ttl(),
+        settings.timeout(),
+    )
+    .await?;
+    tracing::info!(
+        ttl_seconds = settings.ttl_seconds,
+        "durable task attribution is shared through Redis"
+    );
+    Ok(Some(Arc::new(store)))
+}
+
+/// Configuration already refused a `[task_store]` section in a build without
+/// the feature, so there is nothing to connect here.
+#[cfg(not(feature = "redis"))]
+#[expect(
+    clippy::unused_async,
+    reason = "matches the signature of the redis-enabled variant"
+)]
+async fn task_store(
+    _config: &Config,
+) -> Result<Option<Arc<dyn mcp_usage_kit::TaskAttributionStore>>, Box<dyn std::error::Error>> {
+    Ok(None)
+}
+
 fn edge_config(
     config: &Config,
     tenants: Arc<dyn TenantStore>,
     recorder: SharedRecorder,
+    tasks: Option<Arc<dyn mcp_usage_kit::TaskAttributionStore>>,
 ) -> Result<EdgeConfig, Box<dyn std::error::Error>> {
-    let mut edge = EdgeConfig::new(tenants)
+    let mut edge = EdgeConfig::new(tenants);
+    if let Some(tasks) = tasks {
+        edge = edge.with_task_store(tasks);
+    }
+    let mut edge = edge
         .with_recorder(recorder)
         .with_strict_protocol_version(config.edge.strict_protocol_version)
         .with_credential_forwarding(config.edge.credential_forwarding);
@@ -219,7 +263,12 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
     let billing = Arc::new(BillingPipeline::new(exporter));
 
-    let edge = edge_config(&config, tenants, billing.clone())?;
+    let edge = edge_config(
+        &config,
+        tenants,
+        billing.clone(),
+        task_store(&config).await?,
+    )?;
 
     // Pull one snapshot before the listener opens, so the sidecar does not
     // refuse every call for the first refresh interval.
@@ -300,7 +349,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // Usage already recorded but not yet exported would otherwise be lost, so
     // the final flush runs before the process exits rather than after the
     // flush task is dropped.
+    // `abort()` only schedules cancellation: the task is dropped at its next
+    // scheduling point. Without awaiting it, a SIGTERM arriving while the
+    // flush loop is suspended inside an export leaves `flush_in_progress`
+    // set, so the final flush below returns `FlushInProgress` and the process
+    // exits with the whole buffer still in memory.
     flusher.abort();
+    let _ = flusher.await;
     match billing.flush().await {
         Ok(count) => tracing::info!(exported = count, "final flush complete"),
         Err(error) => tracing::error!(%error, "final flush failed; usage may be unexported"),
@@ -320,6 +375,48 @@ async fn flush_loop(billing: Arc<BillingPipeline<EdgeExporter>>, interval: std::
             // picks it up. Logging is all that is owed here.
             Err(error) => tracing::warn!(%error, "flush failed; batch retained for retry"),
         }
+        report_unexported(&billing);
+    }
+}
+
+/// Surface usage that is stuck or gone.
+///
+/// The exporter quarantines a permanently rejected aggregate into a bounded
+/// queue and evicts the oldest when it fills. Nothing read that queue, so
+/// revenue disappeared with no operator-visible signal at all. Draining it
+/// here at least puts every discarded aggregate in the log, and a stuck retry
+/// count is the difference between an invoice that is late and one that is
+/// never coming.
+fn report_unexported(billing: &BillingPipeline<EdgeExporter>) {
+    let retained = billing.retry_buckets();
+    if retained > 0 {
+        tracing::warn!(
+            retained,
+            "usage the provider has not accepted is still buffered in memory; \
+             it is lost if this process exits"
+        );
+    }
+
+    let EdgeExporter::Plane(exporter) = billing.exporter() else {
+        return;
+    };
+    let dropped = exporter.dropped_dead_letters();
+    if dropped > 0 {
+        tracing::error!(
+            dropped,
+            "reconciliation records were discarded because the dead letter \
+             queue is full; this usage cannot be recovered"
+        );
+    }
+    for letter in exporter.take_dead_letters() {
+        tracing::error!(
+            identifier = %letter.aggregate.identifier,
+            customer_id = %letter.aggregate.customer_id,
+            meter = %letter.aggregate.meter,
+            units = letter.aggregate.units,
+            reason = ?letter.reason,
+            "usage was permanently rejected and needs reconciliation"
+        );
     }
 }
 
