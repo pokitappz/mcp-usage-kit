@@ -104,6 +104,15 @@ worse than refusing.
 Revocation is absence. A revoked key stops appearing in the snapshot and stops
 authenticating within one refresh interval, with no restart.
 
+A credential that does not verify is not fatal on its own: the call falls back
+to the ordinary quota check, so a tenant that is inside its cap is served even
+while it keeps attaching a spent credential. Only if quota also refuses is the
+call rejected, and then the answer names what was wrong with the credential
+rather than the generic "payment required".
+
+The credential stops at the gate. It carries the payer's identifier and a
+settlement proof, and the upstream has no business seeing either.
+
 Quota is admission-only and resolves to one refresh interval: a tenant already
 over its cap is refused with `429` and a static code, and nothing is metered for
 that call. A tenant can still overshoot by whatever it spends inside one window.
@@ -151,7 +160,9 @@ authentication in order to fund a payment.
 | `realm` and `method` match this server | A credential for someone else is not payment here |
 | `expires` | A challenge is time-bound |
 | RFC 9530 body digest | Binds a credential to the exact call it paid for, so it cannot be moved to a more expensive one |
-| Single-use claim | The draft requires a proof be spendable exactly once, and concurrent presentations settle at most once |
+| Priced identity in `opaque` | The digest binds the body, but the amount comes from the call's identity, so a credential bought under a cheap name cannot redeem an expensive one |
+| Amount re-priced now | A price change between issue and redemption cannot be ridden out |
+| Single-use reservation | The draft requires a proof be spendable exactly once, and concurrent presentations settle at most once. A proof the method refuses is released again, so nobody can burn a slot with a junk payload |
 
 Only then is the payment method consulted. Each check maps to a registered
 problem type under `https://paymentauth.org/problems/`, so an agent branches on

@@ -29,10 +29,10 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Either, Full, LengthLimitError, Limited};
 use mcp_usage_kit::{
     API_KEY_HEADER, LimitDecision, LimitReason, METHOD_HEADER, MeterBody, Method, NAME_HEADER,
-    PriceBook, assess_limits,
+    assess_limits,
 };
 use tower::{Layer, Service};
 
@@ -142,22 +142,6 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
-/// What this call would be metered at, from the headers the meter itself uses.
-///
-/// Returns `None` for a request the meter would refuse to classify, which the
-/// gate leaves to the meter rather than guessing a price for.
-fn priced_units(headers: &HeaderMap, prices: &PriceBook) -> Option<u64> {
-    let method = headers
-        .get(METHOD_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(Method::parse)?;
-    let name = headers
-        .get(NAME_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| mcp_usage_kit::core::name::decode(value).ok());
-    Some(prices.units_for(&method, name.as_deref()))
-}
-
 /// Convert metered units into the currency's minor unit, rounding up.
 ///
 /// `unit_price_micros` is millionths of a currency unit and a minor unit is a
@@ -207,10 +191,15 @@ fn refuse_quota(reason: LimitReason) -> Response<MeterBody> {
 fn refuse_payment(
     payments: &Payments,
     error: PaymentError,
-    amount_minor: u64,
+    priced: &Priced,
     body: &[u8],
 ) -> Response<MeterBody> {
-    let challenge = payments.challenge(amount_minor, body, &Rfc3339::now());
+    let challenge = payments.challenge(
+        priced.amount_minor,
+        (&priced.method, &priced.name),
+        body,
+        &Rfc3339::now(),
+    );
     let problem = serde_json::json!({
         "type": error.problem_type(),
         "title": error.title(),
@@ -255,91 +244,174 @@ enum Verdict {
     Refuse(Box<Response<MeterBody>>),
 }
 
+/// A call's priced identity and what it is worth right now.
+///
+/// Held together because a challenge has to record all three: the amount is
+/// derived from the identity, so a credential bought under one identity must
+/// not be redeemable under another.
+struct Priced {
+    method: String,
+    name: String,
+    amount_minor: u64,
+}
+
 impl<S> AdmissionService<S> {
+    /// Price this call from the tenant's own price book.
+    ///
+    /// `None` when the tenant is unknown, the cache is too stale to trust, the
+    /// request is one the meter would refuse to classify, or the arithmetic
+    /// overflows. A caller must not turn that into a zero-priced challenge: a
+    /// facilitator will happily settle zero, which would make a pricing
+    /// failure a free pass through the gate.
+    fn price_for(&self, headers: &HeaderMap, unit_price_micros: u64) -> Option<Priced> {
+        let store = self.store.as_ref()?;
+        let key = presented_key(headers)?;
+        let tenant = store.tenant_for(key)?;
+
+        let method = headers
+            .get(METHOD_HEADER)
+            .and_then(|value| value.to_str().ok())?
+            .to_owned();
+        // An absent name is priced, and named, as the empty string rather than
+        // skipped: `units_for` already treats it as "no name", and the
+        // identity has to be a total function or two different calls could
+        // share one.
+        let name = headers
+            .get(NAME_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| mcp_usage_kit::core::name::decode(value).ok())
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default();
+
+        let units = tenant.prices.units_for(
+            &Method::parse(&method),
+            (!name.is_empty()).then_some(name.as_str()),
+        );
+        Some(Priced {
+            method,
+            name,
+            amount_minor: minor_units(units, unit_price_micros)?,
+        })
+    }
+
     /// Decide on a buffered request.
     ///
     /// Async only because verifying a payment proof is: everything the scheme
     /// itself specifies is checked locally before the method is consulted.
-    /// Takes `self` by value rather than by reference: holding `&self`
-    /// across the await would force `Self: Sync`, and so the inner service
-    /// too, which is a constraint the meter does not owe this layer. The
-    /// caller already has a clone, and it is two `Arc`s wide.
+    ///
+    /// Takes `self` by value rather than by reference: holding `&self` across
+    /// the await would force `Self: Sync`, and so the inner service too, which
+    /// is a constraint the meter does not owe this layer. The caller already
+    /// has a clone, and it is two `Arc`s wide.
     async fn decide(self, headers: &HeaderMap, body: &[u8]) -> Verdict {
-        let quota = self.store.as_ref().and_then(|store| {
-            presented_key(headers).and_then(|key| store.quota_for(key).map(|q| (key.to_owned(), q)))
-        });
+        let quota = self
+            .store
+            .as_ref()
+            .and_then(|store| presented_key(headers).and_then(|key| store.quota_for(key)));
+        let priced = quota
+            .as_ref()
+            .and_then(|(_, unit_price, _)| self.price_for(headers, *unit_price));
+        let mut payment_error = None;
 
-        // A presented credential is checked first and on its own terms. It is
+        // A presented credential is checked on its own terms and first. It is
         // how an agent gets past a refusal, so making it conditional on the
-        // quota verdict would mean a tenant back inside its cap could not spend
-        // a credential it had already paid for.
+        // quota verdict would mean a tenant back inside its cap could not
+        // spend a credential it had already paid for.
         if let Some(payments) = self.payments.as_ref()
             && let Some(value) = headers
                 .get(crate::mpp::PAYMENT_AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
+            && let Some(priced) = priced.as_ref()
         {
-            let amount = quota
-                .as_ref()
-                .and_then(|(_, (_, unit_price, _))| self.price_for(headers, *unit_price))
-                .unwrap_or(0);
-            return match payments.verify(value, body, &Rfc3339::now()).await {
+            match payments
+                .verify(
+                    value,
+                    body,
+                    (&priced.method, &priced.name),
+                    priced.amount_minor,
+                    &Rfc3339::now(),
+                )
+                .await
+            {
                 Ok(receipt) => {
                     tracing::info!(method = payments.method(), "admitted a paid call");
-                    Verdict::Admit(Some(receipt.header_value()))
+                    return Verdict::Admit(Some(receipt.header_value()));
                 }
+                // Deliberately falls through rather than refusing here. An
+                // agent that keeps attaching its last credential is entitled
+                // to service while it is inside its quota, and answering 402
+                // to a tenant who owes nothing would strand it. The error is
+                // carried so that if quota does refuse, the answer names what
+                // was actually wrong with the credential rather than the
+                // generic "payment required".
                 Err(error) => {
-                    tracing::info!(problem = %error.problem_type(), "refusing a payment credential");
-                    Verdict::Refuse(Box::new(refuse_payment(payments, error, amount, body)))
+                    tracing::info!(
+                        problem = %error.problem_type(),
+                        "a payment credential did not verify; falling back to quota"
+                    );
+                    payment_error = Some(error);
                 }
-            };
+            }
         }
 
         // An unknown key, or a cache too stale to trust, yields no verdict
         // here. Both are the meter's business, and it will refuse them.
-        let Some((_, (committed, unit_price, limits))) = quota else {
+        let Some((committed, unit_price, limits)) = quota else {
             return Verdict::Admit(None);
         };
-        let decision = assess_limits(committed, 0, unit_price, limits);
-        let LimitDecision::Rejected(reason) = decision else {
+        let LimitDecision::Rejected(reason) = assess_limits(committed, 0, unit_price, limits)
+        else {
             return Verdict::Admit(None);
         };
 
-        let Some(payments) = self.payments.as_ref() else {
+        // Payment is only offered when the call can actually be priced.
+        // Charging zero would be worse than refusing.
+        let (Some(payments), Some(priced)) = (self.payments.as_ref(), priced) else {
             tracing::info!(reason = reason_code(reason), "refusing a call over quota");
             return Verdict::Refuse(Box::new(refuse_quota(reason)));
         };
-        let amount = self.price_for(headers, unit_price).unwrap_or(0);
         tracing::info!(
             reason = reason_code(reason),
-            amount_minor = amount,
+            amount_minor = priced.amount_minor,
             "over quota; offering a payment challenge"
         );
         Verdict::Refuse(Box::new(refuse_payment(
             payments,
-            PaymentError::Required,
-            amount,
+            payment_error.unwrap_or(PaymentError::Required),
+            &priced,
             body,
         )))
     }
+}
 
-    /// Price this call from the tenant's own price book.
-    fn price_for(&self, headers: &HeaderMap, unit_price_micros: u64) -> Option<u64> {
-        let store = self.store.as_ref()?;
-        let key = presented_key(headers)?;
-        let tenant = store.tenant_for(key)?;
-        let units = priced_units(headers, &tenant.prices)?;
-        minor_units(units, unit_price_micros)
-    }
+/// The body handed to the meter.
+///
+/// Left when the gate had no reason to read it, so the original stream is
+/// passed through untouched; right when a payment challenge had to be bound to
+/// a digest of it.
+pub type GateBody<B> = Either<B, Full<Bytes>>;
+
+fn bad_request(code: &str) -> Response<MeterBody> {
+    let mut response = Response::new(body_from(format!(
+        r#"{{"error":"{code}","retryable":false}}"#
+    )));
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 impl<S, B> Service<Request<B>> for AdmissionService<S>
 where
-    S: Service<Request<Full<Bytes>>, Response = Response<MeterBody>, Error = Infallible>
+    S: Service<Request<GateBody<B>>, Response = Response<MeterBody>, Error = Infallible>
         + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     type Response = Response<MeterBody>;
     type Error = Infallible;
@@ -356,18 +428,39 @@ where
         let max_body = self.max_body;
 
         Box::pin(async move {
-            let (parts, body) = request.into_parts();
+            let (mut parts, body) = request.into_parts();
 
-            // The challenge binds to a digest of this body, so the gate has to
-            // see it. The meter buffers again downstream, which for a JSON-RPC
-            // request is a small copy and keeps the two layers independent.
-            let collected = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => return Ok(too_large()),
+            // Only payments need the body, to bind a challenge to a digest of
+            // it. With no payments configured the stream is passed straight
+            // through, so a plain metering sidecar does not pay for a copy it
+            // never reads.
+            let (collected, body) = if gate.payments.is_some() {
+                // `Limited` aborts as soon as the cap is crossed. Collecting
+                // first and measuring afterwards would let an unauthenticated
+                // client spend the sidecar's memory before any credential is
+                // looked at.
+                match Limited::new(body, max_body).collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+                        (bytes.clone(), Either::Right(Full::new(bytes)))
+                    }
+                    Err(error) => {
+                        // `Limited` reports the cap and a transport failure
+                        // through the same error, so they are told apart by
+                        // downcast rather than by conflating the two: telling
+                        // a client to shrink a request that was never too big
+                        // only wastes its time and pollutes triage.
+                        return Ok(if error.downcast_ref::<LengthLimitError>().is_some() {
+                            too_large()
+                        } else {
+                            tracing::debug!("request body could not be read");
+                            bad_request("request_body_unreadable")
+                        });
+                    }
+                }
+            } else {
+                (Bytes::new(), Either::Left(body))
             };
-            if collected.len() > max_body {
-                return Ok(too_large());
-            }
 
             let verdict = gate.decide(&parts.headers, &collected).await;
             let receipt = match verdict {
@@ -375,9 +468,12 @@ where
                 Verdict::Admit(receipt) => receipt,
             };
 
-            let mut response = inner
-                .call(Request::from_parts(parts, Full::new(collected)))
-                .await?;
+            // The gate has consumed the credential. It carries the payer's
+            // identifier and a settlement proof, and the upstream has no
+            // business seeing either, still less logging them.
+            parts.headers.remove(crate::mpp::PAYMENT_AUTHORIZATION);
+
+            let mut response = inner.call(Request::from_parts(parts, body)).await?;
 
             // The draft forbids a receipt on an error response: it asserts the
             // payment settled AND the resource was served.
@@ -436,19 +532,6 @@ mod tests {
             None
         );
         assert_eq!(presented_key(&headers(&[("x-api-key", "")])), None);
-    }
-
-    #[test]
-    fn a_call_is_priced_from_the_tenants_own_price_book() {
-        let prices = PriceBook::flat(1).with_name("sum", 7);
-        let request = headers(&[("mcp-method", "tools/call"), ("mcp-name", "sum")]);
-        assert_eq!(priced_units(&request, &prices), Some(7));
-
-        let other = headers(&[("mcp-method", "tools/call"), ("mcp-name", "other")]);
-        assert_eq!(priced_units(&other, &prices), Some(1));
-
-        // A request the meter would refuse to classify gets no price guess.
-        assert_eq!(priced_units(&headers(&[]), &prices), None);
     }
 
     #[test]

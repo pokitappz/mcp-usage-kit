@@ -76,9 +76,9 @@ flush_interval_seconds = 10
 # enforce_quota = true
 
 # Accept payment instead of refusing an over-quota call, using the "Payment"
-# HTTP authentication scheme (MPP). Requires [control_plane], because a
-# challenge is only ever issued when a tenant is refused and only quota
-# refuses.
+# HTTP authentication scheme (MPP). Requires [control_plane] with
+# enforce_quota = true, because a challenge is only ever issued when a tenant
+# is refused and only quota refuses.
 #
 # [mpp]
 # realm = "mcp.example.com"

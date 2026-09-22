@@ -21,11 +21,11 @@
 //! [`PaymentMethod`] the deployment supplies.
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -245,6 +245,49 @@ fn quoted(value: &str) -> String {
     out
 }
 
+/// The priced identity a challenge was issued for, plus a per-challenge nonce.
+///
+/// Carried in `opaque`, which the draft covers by the binding and requires the
+/// client to echo unchanged. It does two jobs.
+///
+/// The amount is derived from the call's priced identity, but the digest binds
+/// only the body, so without this nothing records *which* identity was priced
+/// and a credential bought under one could be redeemed under another.
+///
+/// The nonce makes every challenge distinct. Everything else in the binding is
+/// deterministic and `expires` has one-second resolution, so two agents behind
+/// one tenant key making the same call in the same second would otherwise
+/// receive the same challenge id, and settling one would burn the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PricedIdentity {
+    /// The MCP method the amount was priced from.
+    pub method: String,
+    /// The tool, prompt or resource name the amount was priced from.
+    pub name: String,
+    /// Unique per challenge.
+    pub nonce: String,
+}
+
+impl PricedIdentity {
+    /// Encode as base64url over canonical JSON, for the `opaque` parameter.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let canonical: BTreeMap<&str, &str> = BTreeMap::from([
+            ("method", self.method.as_str()),
+            ("name", self.name.as_str()),
+            ("nonce", self.nonce.as_str()),
+        ]);
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&canonical).unwrap_or_default())
+    }
+
+    /// Decode from an `opaque` parameter.
+    #[must_use]
+    pub fn decode(encoded: &str) -> Option<Self> {
+        let raw = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+}
+
 /// What a challenge is being issued for.
 #[derive(Debug, Clone)]
 pub struct ChallengeSpec<'a> {
@@ -262,6 +305,8 @@ pub struct ChallengeSpec<'a> {
     pub digest: Option<String>,
     /// Display-only text.
     pub description: Option<String>,
+    /// The priced identity and nonce to carry in `opaque`.
+    pub identity: Option<PricedIdentity>,
 }
 
 impl Challenge {
@@ -269,6 +314,7 @@ impl Challenge {
     #[must_use]
     pub fn new(secret: &[u8], spec: ChallengeSpec<'_>) -> Self {
         let encoded = encode_jcs(spec.request);
+        let opaque = spec.identity.as_ref().map(PricedIdentity::encode);
         // Always moved off `Authorization`: see PAYMENT_AUTHORIZATION.
         let header = Some(PAYMENT_AUTHORIZATION.to_owned());
         let id = challenge_id(
@@ -280,7 +326,7 @@ impl Challenge {
                 request: &encoded,
                 expires: spec.expires.as_deref(),
                 digest: spec.digest.as_deref(),
-                opaque: None,
+                opaque: opaque.as_deref(),
                 header: header.as_deref(),
             },
         );
@@ -293,7 +339,7 @@ impl Challenge {
             expires: spec.expires,
             digest: spec.digest,
             description: spec.description,
-            opaque: None,
+            opaque,
             header,
         }
     }
@@ -645,58 +691,82 @@ impl PaymentMethod for FacilitatorMethod {
 /// Single-use enforcement for payment proofs.
 ///
 /// The draft requires that a proof be usable exactly once and that concurrent
-/// presentations of the same credential settle at most once. Claiming is
-/// therefore a test-and-set under one lock rather than a check followed by a
-/// later insert.
+/// presentations of the same credential settle at most once. Reserving is
+/// therefore a test-and-set under one lock, taken *before* the payment method
+/// is consulted, so two racing presentations cannot both reach settlement.
+///
+/// A reservation that does not settle is released again. Holding it would let
+/// anyone burn a slot for the price of a junk payload, and slots are the
+/// resource that keeps the guard bounded.
+///
+/// Entries expire by age rather than being cleared wholesale. Clearing reopens
+/// the replay window for every credential at once, which an attacker can
+/// trigger on demand by filling the set; ageing them out cannot be forced, and
+/// is safe because a credential older than its challenge lifetime is already
+/// refused by the expiry check before it ever reaches here.
 ///
 /// This is process-local. A horizontally scaled deployment needs a shared
 /// store, the same way durable task attribution does.
 #[derive(Debug)]
 pub struct ReplayGuard {
-    spent: Mutex<HashSet<String>>,
+    spent: Mutex<HashMap<String, Instant>>,
+    retain_for: Duration,
     capacity: usize,
 }
 
 impl ReplayGuard {
-    /// Track at most `capacity` spent proofs.
+    /// Remember a spent proof for `retain_for`, up to `capacity` of them.
+    ///
+    /// `retain_for` should be at least the challenge lifetime: anything older
+    /// cannot be redeemed anyway.
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, retain_for: Duration) -> Self {
         Self {
-            spent: Mutex::new(HashSet::new()),
+            spent: Mutex::new(HashMap::new()),
+            retain_for,
             capacity,
         }
     }
 
-    /// Claim a proof. `true` the first time, `false` on every later attempt.
-    pub fn claim(&self, key: &str) -> bool {
-        let mut spent = self
-            .spent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Bounded so a long-running sidecar cannot be grown without limit by
-        // unique credentials. Clearing rather than evicting one entry keeps the
-        // structure simple; the window it reopens is bounded by `capacity`, and
-        // a deployment that cannot accept that needs the shared store anyway.
-        if spent.len() >= self.capacity {
-            tracing::warn!(
-                capacity = self.capacity,
-                "spent-proof set is full; clearing it reopens a replay window"
-            );
-            spent.clear();
-        }
-        spent.insert(key.to_owned())
-    }
-
-    /// Number of proofs currently remembered.
-    #[must_use]
-    pub fn len(&self) -> usize {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
         self.spent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
     }
 
-    /// Whether nothing has been spent yet.
+    /// Reserve a proof. `true` the first time, `false` while it is held.
+    ///
+    /// A caller that does not go on to settle must [`release`](Self::release).
+    pub fn reserve(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut spent = self.lock();
+        spent.retain(|_, reserved| now.duration_since(*reserved) < self.retain_for);
+
+        // Refusing at capacity rather than evicting a live entry: dropping one
+        // would make a paid credential replayable, and refusing only delays a
+        // payment that can be retried against a fresh challenge.
+        if spent.len() >= self.capacity && !spent.contains_key(key) {
+            tracing::error!(
+                capacity = self.capacity,
+                "spent-proof set is full; refusing new payments until entries age out"
+            );
+            return false;
+        }
+        spent.insert(key.to_owned(), now).is_none()
+    }
+
+    /// Give a reservation back, for a proof that did not settle.
+    pub fn release(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
+    /// Number of proofs currently held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether nothing is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -718,7 +788,7 @@ pub struct PaymentsConfig {
     pub recipient: String,
     /// How long a challenge stays answerable.
     pub ttl: Duration,
-    /// How many spent proofs to remember.
+    /// How many spent proofs to hold at once.
     pub replay_capacity: usize,
 }
 
@@ -758,7 +828,10 @@ impl Payments {
             recipient: config.recipient,
             ttl: config.ttl,
             method,
-            replay: ReplayGuard::new(config.replay_capacity),
+            // Retained for twice the challenge lifetime: anything older is
+            // already refused by the expiry check, and the margin covers
+            // clock skew between issue and redemption.
+            replay: ReplayGuard::new(config.replay_capacity, config.ttl.saturating_mul(2)),
         }
     }
 
@@ -768,11 +841,13 @@ impl Payments {
         self.method.method()
     }
 
-    /// Issue a challenge for a call priced at `amount_minor`, bound to `body`.
+    /// Issue a challenge for a call priced at `amount_minor`, bound to `body`
+    /// and to the priced identity the amount came from.
     #[must_use]
     pub fn challenge(
         &self,
         amount_minor: u64,
+        identity: (&str, &str),
         body: &[u8],
         now: &chrono_lite::Rfc3339,
     ) -> Challenge {
@@ -793,11 +868,22 @@ impl Payments {
                 // a different, more expensive call.
                 digest: Some(content_digest(body)),
                 description: None,
+                identity: Some(PricedIdentity {
+                    method: identity.0.to_owned(),
+                    name: identity.1.to_owned(),
+                    nonce: uuid::Uuid::new_v4().to_string(),
+                }),
             },
         )
     }
 
     /// Run every check the scheme specifies, then the method's own.
+    ///
+    /// `identity` is the priced identity of the call being made now, and
+    /// `amount_minor` what it is worth now. Both are compared against what the
+    /// challenge was issued for: the digest binds the body, but the amount is
+    /// derived from the call's identity, so without this a credential bought
+    /// under a cheap identity could be redeemed under an expensive one.
     ///
     /// # Errors
     ///
@@ -807,6 +893,8 @@ impl Payments {
         &self,
         header_value: &str,
         body: &[u8],
+        identity: (&str, &str),
+        amount_minor: u64,
         now: &chrono_lite::Rfc3339,
     ) -> Result<Receipt, PaymentError> {
         let credential = parse_credential(header_value)?;
@@ -835,25 +923,46 @@ impl Payments {
             return Err(PaymentError::DigestMismatch);
         }
 
+        let issued = challenge
+            .opaque
+            .as_deref()
+            .and_then(PricedIdentity::decode)
+            .ok_or(PaymentError::InvalidChallenge)?;
+        if issued.method != identity.0 || issued.name != identity.1 {
+            tracing::warn!("a credential was presented under a different priced identity");
+            return Err(PaymentError::InvalidChallenge);
+        }
+
         let request = challenge
             .payment_request()
             .ok_or(PaymentError::InvalidChallenge)?;
+        // Re-priced now rather than trusted from the challenge, so a price
+        // change between issue and redemption cannot be ridden out.
+        if request.amount != amount_minor.to_string() {
+            tracing::warn!("a credential was presented for the wrong amount");
+            return Err(PaymentError::Insufficient);
+        }
 
-        // Claimed before verification, so two concurrent presentations of one
-        // credential cannot both reach the method and settle twice. The cost is
-        // that a proof rejected by the method is still burned, which is the
-        // safe direction: the agent retries against a fresh challenge.
-        if !self.replay.claim(&challenge.id) {
-            tracing::warn!("refusing a replayed payment credential");
+        // Reserved before verification, so two concurrent presentations of one
+        // credential cannot both reach the method and settle twice. Released
+        // again below if it does not settle, because holding it would let
+        // anyone burn a slot for the price of a junk payload.
+        if !self.replay.reserve(&challenge.id) {
+            tracing::warn!("refusing a replayed or contended payment credential");
             return Err(PaymentError::VerificationFailed);
         }
 
-        let reference = self.method.verify(&credential, &request).await?;
-        Ok(Receipt::new(
-            challenge.method.clone(),
-            reference,
-            now.to_string(),
-        ))
+        match self.method.verify(&credential, &request).await {
+            Ok(reference) => Ok(Receipt::new(
+                challenge.method.clone(),
+                reference,
+                now.to_string(),
+            )),
+            Err(error) => {
+                self.replay.release(&challenge.id);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1032,6 +1141,11 @@ mod tests {
             expires: expires.map(str::to_owned),
             digest,
             description: None,
+            identity: Some(PricedIdentity {
+                method: "tools/call".to_owned(),
+                name: "search".to_owned(),
+                nonce: "fixed-for-determinism".to_owned(),
+            }),
         }
     }
 
@@ -1150,7 +1264,8 @@ mod tests {
             "challenge": {
                 "id": challenge.id, "realm": challenge.realm,
                 "method": challenge.method, "intent": challenge.intent,
-                "request": challenge.request, "header": challenge.header
+                "request": challenge.request, "opaque": challenge.opaque,
+                "header": challenge.header
             },
             "source": "did:example:payer",
             "payload": {"proof": "0xabc123"}
@@ -1200,27 +1315,54 @@ mod tests {
     }
 
     #[test]
-    fn a_proof_can_be_claimed_exactly_once() {
-        let guard = ReplayGuard::new(16);
-        assert!(guard.claim("proof-1"));
+    fn a_proof_can_be_reserved_exactly_once() {
+        let guard = ReplayGuard::new(16, Duration::from_secs(600));
+        assert!(guard.reserve("proof-1"));
         assert!(
-            !guard.claim("proof-1"),
-            "a spent proof must not be reusable"
+            !guard.reserve("proof-1"),
+            "a held proof must not be reservable again"
         );
-        assert!(guard.claim("proof-2"));
+        assert!(guard.reserve("proof-2"));
         assert_eq!(guard.len(), 2);
     }
 
     #[test]
-    fn the_replay_set_stays_bounded() {
-        let guard = ReplayGuard::new(4);
-        for index in 0..10 {
-            guard.claim(&format!("proof-{index}"));
+    fn a_released_reservation_can_be_retried() {
+        // A proof the method refused was never spent, so holding it would let
+        // anyone burn a slot for the price of a junk payload.
+        let guard = ReplayGuard::new(16, Duration::from_secs(600));
+        assert!(guard.reserve("proof-1"));
+        guard.release("proof-1");
+        assert_eq!(guard.len(), 0);
+        assert!(guard.reserve("proof-1"));
+    }
+
+    #[test]
+    fn a_full_set_refuses_rather_than_forgetting_what_was_spent() {
+        // Clearing at capacity would make every held credential replayable,
+        // and an attacker can reach capacity on demand. Refusing only delays
+        // a payment, which can be retried against a fresh challenge.
+        let guard = ReplayGuard::new(4, Duration::from_secs(600));
+        for index in 0..4 {
+            assert!(guard.reserve(&format!("proof-{index}")));
         }
+        assert!(!guard.reserve("one-too-many"));
         assert!(
-            guard.len() <= 4,
-            "the spent set must not grow without limit"
+            !guard.reserve("proof-0"),
+            "an already-spent proof must stay spent even when the set is full"
         );
+        assert_eq!(guard.len(), 4);
+    }
+
+    #[test]
+    fn entries_age_out_so_the_set_cannot_grow_without_limit() {
+        // Zero retention: every entry is already too old to matter, which is
+        // the branch a long-running sidecar reaches continuously.
+        let guard = ReplayGuard::new(4, Duration::ZERO);
+        for index in 0..10 {
+            guard.reserve(&format!("proof-{index}"));
+        }
+        assert!(guard.len() <= 1, "aged entries must be dropped");
     }
 
     #[test]
@@ -1249,5 +1391,99 @@ mod tests {
             PaymentError::Insufficient.problem_type(),
             "https://paymentauth.org/problems/payment-insufficient"
         );
+    }
+    #[test]
+    fn a_challenge_survives_its_own_header_encoding() {
+        // Issue, render, re-parse the way a client must, rebuild, and check
+        // the binding. Anything the header form loses breaks every payment.
+        let challenge = Challenge::new(
+            SECRET,
+            spec(Some("2099-01-01T00:00:00Z"), Some(content_digest(b"body"))),
+        );
+        let rendered = challenge.header_value();
+        let params = rendered.strip_prefix("Payment ").expect("scheme");
+
+        let mut parsed = std::collections::HashMap::new();
+        for part in params.split(", ") {
+            let (key, value) = part.split_once('=').expect("auth-param");
+            parsed.insert(key.to_owned(), value.trim_matches('"').to_owned());
+        }
+        let rebuilt = Challenge {
+            id: parsed["id"].clone(),
+            realm: parsed["realm"].clone(),
+            method: parsed["method"].clone(),
+            intent: parsed["intent"].clone(),
+            request: parsed["request"].clone(),
+            expires: parsed.get("expires").cloned(),
+            digest: parsed.get("digest").cloned(),
+            description: parsed.get("description").cloned(),
+            opaque: parsed.get("opaque").cloned(),
+            header: parsed.get("header").cloned(),
+        };
+        assert_eq!(rebuilt.opaque, challenge.opaque, "opaque must survive");
+        assert_eq!(rebuilt.digest, challenge.digest, "digest must survive");
+        assert_eq!(rebuilt.expires, challenge.expires, "expires must survive");
+        assert!(
+            rebuilt.binding_is_valid(SECRET),
+            "a challenge that cannot survive its own header form is unusable"
+        );
+    }
+
+    #[test]
+    fn two_challenges_for_the_same_call_in_the_same_second_differ() {
+        // Everything else in the binding is deterministic and `expires` has
+        // one-second resolution, so without the nonce two agents behind one
+        // tenant key would share an id and settling one would burn the other.
+        let request = request();
+        let build = || {
+            Challenge::new(
+                SECRET,
+                ChallengeSpec {
+                    realm: "api.example.com",
+                    method: "example",
+                    intent: "charge",
+                    request: &request,
+                    expires: Some("2026-01-15T12:05:00Z".to_owned()),
+                    digest: Some(content_digest(b"body")),
+                    description: None,
+                    identity: Some(PricedIdentity {
+                        method: "tools/call".to_owned(),
+                        name: "sum".to_owned(),
+                        nonce: uuid::Uuid::new_v4().to_string(),
+                    }),
+                },
+            )
+        };
+        assert_ne!(build().id, build().id);
+    }
+
+    #[test]
+    fn the_priced_identity_round_trips_through_opaque() {
+        let identity = PricedIdentity {
+            method: "tools/call".to_owned(),
+            name: "sum".to_owned(),
+            nonce: "n".to_owned(),
+        };
+        assert_eq!(PricedIdentity::decode(&identity.encode()), Some(identity));
+        assert_eq!(PricedIdentity::decode("not-base64!!!"), None);
+    }
+
+    #[test]
+    fn opaque_is_covered_by_the_binding() {
+        // If it were not, an agent could rewrite the priced identity a
+        // credential was bought under and redeem a cheap one for a dear call.
+        let challenge = Challenge::new(SECRET, spec(None, None));
+        assert!(challenge.binding_is_valid(SECRET));
+
+        let mut tampered = challenge.clone();
+        tampered.opaque = Some(
+            PricedIdentity {
+                method: "tools/call".to_owned(),
+                name: "expensive".to_owned(),
+                nonce: "n".to_owned(),
+            }
+            .encode(),
+        );
+        assert!(!tampered.binding_is_valid(SECRET));
     }
 }

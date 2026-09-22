@@ -86,6 +86,12 @@ pub enum ConfigError {
          and quota needs the authoritative counters only a control plane has"
     )]
     MppWithoutPlane,
+    /// `[mpp]` was configured with quota enforcement turned off.
+    #[error(
+        "[mpp] requires control_plane.enforce_quota: a challenge is only ever offered when \
+         quota refuses a call, so with enforcement off the section would do nothing"
+    )]
+    MppWithoutQuota,
     /// `mpp.facilitator.url` is not usable.
     #[error("mpp.facilitator.url must be an absolute https URL, got {0:?}")]
     FacilitatorUrl(String),
@@ -575,8 +581,15 @@ impl Config {
             // A challenge is only ever issued when a tenant is refused, and
             // only quota refuses. Without a plane the gate never refuses, so
             // the section would silently do nothing.
-            if self.control_plane.is_none() {
+            let Some(plane) = &self.control_plane else {
                 return Err(ConfigError::MppWithoutPlane);
+            };
+            // Without enforcement the gate never refuses, so a challenge is
+            // never issued and the whole section is dead config. Worse, the
+            // only observable effect would be that a request carrying a stale
+            // credential takes a slower path to the same answer.
+            if !plane.enforce_quota {
+                return Err(ConfigError::MppWithoutQuota);
             }
             if mpp.challenge_ttl_seconds == 0 {
                 return Err(ConfigError::ZeroChallengeTtl);
