@@ -16,31 +16,39 @@ Administration write permission.
 
 ## Prepare a release
 
-1. Update `workspace.package.version` in `Cargo.toml` and regenerate
-   `Cargo.lock`. That single value also drives the internal dependency
-   requirements, which are declared once in `[workspace.dependencies]`;
-   `scripts/check-release-version.sh` fails the build if any of them drift,
-   because a stale one is invisible until it breaks a partially-completed
-   publish.
-2. Move the relevant changelog entries from Unreleased into a dated version.
-3. Merge the release commit to `main` and wait for every required CI check.
-4. Run the complete CI command set from `CONTRIBUTING.md`.
-5. Run `cargo package --workspace --locked` and inspect each generated archive.
+1. Update `workspace.package.version` in `Cargo.toml` **and** the five internal
+   requirements in `[workspace.dependencies]`. They are separate literals, not
+   derived from that value, which is why `scripts/check-release-version.sh`
+   exists: a stale one is invisible to `cargo package` and to every CI job, and
+   then breaks a partially-completed publish with the earlier crates already
+   released and unpublishable again.
+2. Update `bindings/python/Cargo.toml` to the same version. The binding is
+   excluded from the workspace, so `cargo metadata --no-deps` cannot see it and
+   the release guard does not cover it; the Python CI job compares it
+   separately.
+3. Regenerate both `Cargo.lock` files.
+4. Move the relevant changelog entries into a dated version.
+5. Merge the release commit to `main` and wait for every required CI check.
+6. Run the complete CI command set from `CONTRIBUTING.md`.
+7. Run `cargo package --workspace --locked` and inspect each generated archive.
    Verification resolves the sibling crates from the archives built in the same
    run, so this works even when none of them are in the registry yet.
 
 ## First release
 
-**`mcp-usage-edge` has never been published.** It was added to the workspace
-and to `scripts/publish-crates.sh` after v0.3.1, so the next release needs this
-section, not "Later releases". The other five have been published since v0.3.0.
+**All six crates have been published since v0.4.0**, so this section no longer
+applies to an ordinary release; see "Later releases" below. It is kept for
+reference, and for any crate added to the workspace later, which would be
+unpublished and would need this path for its own first version.
 
-Publishing the six together without doing this first is the failure the release
-workflow's "Refuse a first release" step exists to stop: trusted publishing
-needs a trusted publisher, which can only be configured against a crate that
-already exists, so `mcp-usage-edge` would fail at authentication *after* the
-other five had already been published at the new version and could not be
-published again. Confirm the current state with:
+`mcp-usage-edge` needed it at v0.4.0. It was added to the workspace and to
+`scripts/publish-crates.sh` after v0.3.1 but not to the release workflow's
+"Refuse a first release" step, which still listed five crates. Tagging a release
+in that state would have passed the guard, published the five that existed,
+irreversibly, and then failed authenticating the sixth, because trusted
+publishing needs a publisher that can only be configured against a crate that
+already exists. **If you add a crate to `scripts/publish-crates.sh`, add it to
+that guard in the same commit.** Confirm the current state with:
 
 ```sh
 for c in mcp-usage-core mcp-usage-export mcp-usage-tower mcp-usage-store \
@@ -58,23 +66,32 @@ that can only be configured on a crate that already exists; the workflow
 refuses to run for an unpublished crate rather than failing halfway through.
 
 crates.io requires the first version of each new crate to be published with a
-regular API token. Publish in this order, allowing the registry index to expose
-each dependency before publishing the next crate:
+regular API token. A new crate cannot be published on its own if it depends on
+a sibling at the version being released, because that version is not in the
+registry yet - publish the whole workspace, which orders the crates and waits
+for the index between them:
 
 ```sh
-cargo publish -p mcp-usage-core --locked
-cargo publish -p mcp-usage-export --locked
-cargo publish -p mcp-usage-tower --locked
-cargo publish -p mcp-usage-store --locked
-cargo publish -p mcp-usage-kit --locked
+cargo publish --workspace --locked --dry-run   # rehearse first
+cargo publish --workspace --locked
 ```
 
-Afterward, configure a trusted publisher for each crate on crates.io with:
+That is how v0.4.0 went out. `mcp-usage-edge` could not have been published
+alone beforehand: at 0.3.1 its `ControlPlaneTenantStore` no longer matched the
+published `mcp-usage-kit 0.3.1` `TenantStore` trait, and at 0.4.0 it needed a
+`mcp-usage-kit` that did not exist yet.
+
+Afterward, configure a trusted publisher for the new crate on crates.io with:
 
 - GitHub owner: `pokitappz`
 - Repository: `mcp-usage-kit`
 - Workflow: `release.yml`
 - Environment: `release`
+
+v0.4.0 has a git tag but **no GitHub Release**, because the crates were already
+published by hand and `release.yml` fires on `release: published` - creating one
+would have sent the workflow to republish versions that already exist. Pushing a
+plain tag does not trigger it.
 
 The GitHub `release` environment requires an explicit reviewer and accepts only
 tags matching `v*`. Release tags are immutable. The workflow also verifies that
