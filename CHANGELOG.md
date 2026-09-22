@@ -5,6 +5,122 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-22
+
+Breaking. Two public signatures changed, both to fix behaviour that was wrong
+or expensive on every request. A `0.3` caller needs two edits, listed first.
+
+### Changed
+
+- **Breaking.** `TenantStore::authenticate` returns `Option<Arc<Tenant>>` rather
+  than `Option<Tenant>`. It runs once per request and a `PriceBook` is two
+  `BTreeMap`s, so returning a value deep-copied every priced tool name on every
+  call. An implementation only needs to wrap its return in `Arc::new`; a caller
+  reading fields through the `Arc` needs no change at all.
+- **Breaking.** `ResponsePeek::with_legacy_delivery` takes the originating
+  `&Method`. It used to promote any result on a legacy revision to a delivery,
+  which billed an idle legacy client for its own lifecycle traffic forever. It
+  now promotes only methods that deliver priced work.
+- `MetricsSnapshot` gained `free_by_reason` and `unrecognized_by_reason`.
+  Exhaustive struct literals break; it still derives `Default`, so
+  `..Default::default()` does not.
+- Cut the per-request cost of the metered path. Measured end to end through
+  `MeterLayer` against an in-memory origin by the new `hot_path` bench, so the
+  figures are meter overhead rather than origin work; median of three runs:
+
+  | case | 0.3.1 | 0.4.0 | |
+  |---|---|---|---|
+  | `tools/call`, 2 KB body, 1 priced tool | 11.2 us | 9.4 us | -16% |
+  | `tools/call`, 2 KB body, 64 priced tools | 14.8 us | 9.1 us | -38% |
+  | `tools/call`, 128 KB body, 64 priced tools | 122 us | 108 us | -11% |
+  | `tools/call` over SSE, 64 priced tools | 16.0 us | 9.6 us | -40% |
+  | `tools/list` cache hit, 64-tool listing | 348 us | 196 us | -44% |
+
+  Non-cacheable methods no longer parse the whole body into a `serde_json::Value`
+  to read four fields; the SSE reader no longer rewrites the captured body twice
+  to normalize line endings; a cache hit no longer deep-copies the stored
+  response under the cache mutex to overwrite one field, and `insert` no longer
+  sweeps the whole cache on every call.
+- `BillingPipeline` alternates between the retry queue and fresh usage after a
+  failure instead of always serving retries first, and reports `retry_buckets`
+  separately from `pending_buckets`.
+- The edge's quota gate is `AdmissionLayer`, not `QuotaLayer`: it decides
+  admission on two grounds now rather than one.
+
+### Added
+
+- `mcp-usage-edge`, a metering sidecar that fronts an MCP server written in any
+  language. Reverse proxy plus `MeterLayer`, TOML configuration, a control-plane
+  tenant cache that fails closed past a staleness budget, and a distroless
+  image. **This crate has never been published; see the "First release" section
+  of `RELEASE.md` before tagging.**
+- A Python binding over `mcp-usage-core`, published to PyPI as `mcp-usage-kit`,
+  proven against the same `conformance/v1/cases.json` vectors the Rust
+  reference test runs and exercised on its declared `abi3-py39` floor.
+- Inbound MPP support at the edge: with an `[mpp]` section an over-quota call
+  is priced rather than refused, answering 402 with a `WWW-Authenticate: Payment`
+  challenge per `draft-ryan-httpauth-payment-01`. The credential rides
+  `Payment-Authorization`, because `Authorization` carries the tenant's own key
+  to the upstream.
+- `FreeReason::ALL`, `::as_str` and `::index`, which define the eleven wire
+  names once so metrics, the binding and the conformance vectors cannot drift
+  into three spellings.
+- `UnaccountedReason`, naming the four unrelated causes that previously shared
+  `unrecognized_responses`.
+- Two Prometheus families, `mcp_usage_free_deliveries_by_reason_total` and
+  `mcp_usage_unrecognized_responses_by_reason_total`, both labelled `reason`
+  from a closed enum and emitted for every reason on every scrape so a `rate()`
+  resolves before that reason first fires. `reason` is the only label the edge
+  emits.
+- `[task_store]` in the sidecar, wiring `RedisTaskStore` behind a `redis`
+  feature. A `[task_store]` section in a build without the feature is refused at
+  startup rather than ignored.
+
+### Fixed
+
+- A legacy client's lifecycle traffic was billed as delivered work, forever, for
+  as long as it stayed connected.
+- A completed task whose verdict came back free had its attribution destroyed,
+  so every later poll reported a missing attribution and the charge was lost
+  permanently.
+- One batch the billing provider refused blocked every other customer's usage
+  from ever being exported, and the buffer is in memory, so the next deploy took
+  all of it.
+- `flusher.abort()` only scheduled cancellation, so a SIGTERM during an export
+  could exit with the whole buffer unflushed. The handle is awaited.
+- Permanently rejected aggregates were quarantined into a queue nothing read and
+  silently evicted when it filled. The flush loop drains them and raises an
+  error when retention has discarded anything.
+- The sidecar used the process-local task store, so a task created on one
+  instance and completed on another billed nothing: roughly `1 - 1/N` of
+  durable-task revenue on an N-instance deployment.
+- A `PostgresTaskStore` insert used `ON CONFLICT DO NOTHING`, which ignores
+  `expires_at`. A task id reused after its attribution expired reported success,
+  wrote nothing, and was unbillable from then on.
+- An MPP credential bought for a cheap call could redeem an expensive one; two
+  legitimate payments in the same second could collide and destroy one; the
+  request body was buffered before its size limit was checked; and the
+  spent-proof set was cleared wholesale when full, which made an already-spent
+  credential replayable. A failed credential no longer hard-refuses a tenant who
+  is inside quota, `Payment-Authorization` no longer reaches the upstream, and a
+  pricing failure no longer issues a zero-amount challenge.
+- `LimitReason::ArithmeticOverflow` reported two different wire names from the
+  binding and the sidecar. Both say `usage_unrepresentable`.
+- `Meter.decide` and `Meter.price` decode the `Mcp-Name` sentinel form
+  themselves, so passing the raw header no longer silently charges every
+  non-ASCII-named tool the default price.
+
+### Documentation
+
+- The durable-task store TTL is a deadline on the whole task, not on the polling
+  interval, and a task that outlives it loses its charge silently. Documented on
+  the crate root and both constructors, with the metric to watch and why a
+  per-task TTL needs a `TaskAttributionStore` change rather than a backend one.
+- `terminal_response` records why an undeclared or unrecognized `Content-Type`
+  is still not read as MCP: the meter will not infer a charge from a body whose
+  sender did not say it was MCP. What was wrong was the silence, not the
+  refusal.
+
 ## [0.3.1] - 2026-09-08
 
 ### Changed
