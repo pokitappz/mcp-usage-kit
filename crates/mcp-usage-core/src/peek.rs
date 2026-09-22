@@ -135,9 +135,18 @@ impl ResponsePeek {
     /// response missing its discriminant must stay unrecognized: there, absence means
     /// the meter failed to understand the result, and guessing would bill for work that
     /// may never have been delivered.
+    ///
+    /// Scoped to the methods that can deliver priced work at all. Without that,
+    /// the promotion reaches every legacy method, and `{"result":{}}` from a
+    /// `ping` or an `initialize` becomes a billable delivery: a connected but
+    /// idle legacy client is then charged for its keepalives forever, while a
+    /// modern client generating identical traffic is charged nothing.
     #[must_use]
-    pub fn with_legacy_delivery(mut self) -> Self {
-        if matches!(self.result_type, ResultType::Absent) && !self.is_error {
+    pub fn with_legacy_delivery(mut self, method: &crate::Method) -> Self {
+        if method.delivers_priced_work()
+            && matches!(self.result_type, ResultType::Absent)
+            && !self.is_error
+        {
             self.result_type = ResultType::Complete;
         }
         self
@@ -230,6 +239,85 @@ fn peek_task(result: &Value) -> Option<TaskPeek> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Call, Charge, Method, PriceBook, decide};
+
+    /// What a legacy server answers a lifecycle call with: a bare result.
+    fn bare_result() -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": 1, "result": {}})
+    }
+
+    #[test]
+    fn the_legacy_promotion_reaches_only_methods_that_deliver_priced_work() {
+        // The promotion exists so a legacy `tools/call` is not free. Applied
+        // to every method it also bills `ping` and `initialize`, so an idle
+        // legacy client is charged for its keepalives forever while a modern
+        // client on identical traffic is charged nothing.
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            let promoted = response(&bare_result()).with_legacy_delivery(&Method::parse(method));
+            assert_eq!(
+                promoted.result_type,
+                ResultType::Complete,
+                "{method} delivers priced work and must still be promoted"
+            );
+        }
+
+        for method in [
+            "ping",
+            "initialize",
+            "notifications/initialized",
+            "logging/setLevel",
+            "resources/subscribe",
+            "completion/complete",
+            "vendor/extension",
+            "tools/list",
+            "tasks/get",
+        ] {
+            let promoted = response(&bare_result()).with_legacy_delivery(&Method::parse(method));
+            assert_eq!(
+                promoted.result_type,
+                ResultType::Absent,
+                "{method} delivers no priced work and must not be promoted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_legacy_client_is_billed_nothing_for_its_keepalives() {
+        // The end-to-end shape of the bug: a connected client pinging on a
+        // timer, billed at the flat rate on every beat.
+        let prices = PriceBook::flat(1);
+        for method in ["ping", "initialize", "logging/setLevel"] {
+            let parsed = Method::parse(method);
+            let observed = response(&bare_result()).with_legacy_delivery(&parsed);
+            let charge = decide(&Call::new(parsed, None), &observed, &prices);
+            assert!(
+                matches!(charge, Charge::Free(_)),
+                "{method} billed {charge:?} on the legacy path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_tool_call_is_still_billed() {
+        // The regression guard for the fix itself: scoping the promotion must
+        // not make legacy tool calls free, which is what it exists to prevent.
+        let observed = response(&bare_result()).with_legacy_delivery(&Method::ToolsCall);
+        let charge = decide(
+            &Call::new(Method::ToolsCall, Some("search".to_owned())),
+            &observed,
+            &PriceBook::flat(3),
+        );
+        assert!(matches!(charge, Charge::Billable(b) if b.units == 3));
+    }
+
+    #[test]
+    fn a_legacy_error_is_never_promoted() {
+        let error = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "x"}});
+        let promoted = response(&error).with_legacy_delivery(&Method::ToolsCall);
+        assert!(promoted.is_error);
+        assert_eq!(promoted.result_type, ResultType::Absent);
+    }
+
     use super::*;
     use serde_json::json;
 

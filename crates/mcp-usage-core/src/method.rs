@@ -166,6 +166,24 @@ impl Method {
     pub const fn is_task_drive(&self) -> bool {
         matches!(self, Self::TasksGet | Self::TasksUpdate | Self::TasksCancel)
     }
+
+    /// Whether this method can deliver work that is worth charging for.
+    ///
+    /// Three methods do. Everything else is lifecycle (`initialize`, `ping`),
+    /// discovery, task plumbing, or a vendor extension, and none of those
+    /// deliver a priced result no matter what they answer with.
+    ///
+    /// Deliberately its own predicate rather than a reuse of
+    /// [`Self::carries_name`], which happens to match the same three today:
+    /// they answer different questions, and a future method that carries a
+    /// name without delivering priced work must not silently start billing.
+    #[must_use]
+    pub const fn delivers_priced_work(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolsCall | Self::ResourcesRead | Self::PromptsGet
+        )
+    }
 }
 
 impl fmt::Display for Method {
