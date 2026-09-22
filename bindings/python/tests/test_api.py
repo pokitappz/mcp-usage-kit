@@ -143,12 +143,55 @@ def test_arithmetic_that_cannot_be_represented_is_rejected_not_wrapped():
         committed_units=2**64 - 1, requested_units=2, max_units=None
     )
     assert not outcome.allowed
-    assert outcome.reason == "arithmetic_overflow"
+    assert outcome.reason == "usage_unrepresentable"
 
 
 def test_unbounded_limits_admit_everything():
     outcome = usage.assess_limits(committed_units=10**9, requested_units=10**6)
     assert outcome.allowed
+
+
+def test_limit_reasons_match_the_codes_the_sidecar_returns():
+    # One variant, one wire name. A caller moving from the sidecar to the
+    # in-process binding must not silently stop matching on these. The
+    # sidecar's own list is in crates/mcp-usage-edge/src/admission.rs.
+    assert usage.assess_limits(committed_units=2, max_units=1).reason == "quota_exceeded"
+    assert (
+        usage.assess_limits(
+            committed_spend_micros=2, requested_units=0, max_spend_micros=1
+        ).reason
+        == "spend_cap_exceeded"
+    )
+    assert (
+        usage.assess_limits(committed_units=2**64 - 1, requested_units=2).reason
+        == "usage_unrepresentable"
+    )
+
+
+def test_decide_decodes_an_encoded_tool_name_before_pricing():
+    # The obvious middleware reads Mcp-Name and passes it straight in. An
+    # encoded value matches nothing in the price book, which would silently
+    # charge every non-ASCII-named tool the default instead of its own price.
+    meter = usage.Meter(usage.PriceBook(default_units=1, names={"h\u00e9llo": 7}))
+    encoded = "=?base64?aMOpbGxv?="
+
+    assert meter.price("tools/call", encoded) == 7
+    charge = meter.decide(
+        method="tools/call", name=encoded, response=usage.delivered()
+    )
+    assert charge.billable
+    assert charge.units == 7, "an encoded name must be priced as the tool it names"
+    assert charge.name == "h\u00e9llo", "and reported decoded"
+
+
+def test_a_malformed_encoded_name_is_refused_rather_than_mispriced():
+    meter = usage.Meter()
+    with pytest.raises(ValueError, match="invalid tool name"):
+        meter.decide(
+            method="tools/call",
+            name="=?base64?!!!not-base64!!!?=",
+            response=usage.delivered(),
+        )
 
 
 def test_the_name_header_sentinel_is_decoded():

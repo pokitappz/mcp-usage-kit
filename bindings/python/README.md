@@ -59,6 +59,11 @@ These do that translation in one tested place, because hand-writing
 If you already hold the raw response, pass it directly: `decide` accepts a
 mapping or a JSON string.
 
+`name` may be the raw `Mcp-Name` header value. The sentinel form
+(`=?base64?...?=`) is decoded before pricing, because an encoded value matches
+nothing in the price book and would otherwise charge every non-ASCII-named
+tool the default instead of its own price.
+
 ## Durable tasks
 
 A `tasks/get` carries no name of its own, so a completed task cannot be priced
@@ -90,7 +95,9 @@ outcome.allowed  # True: exact boundaries are allowed
 ```
 
 A limit rejects only when the new total would be *greater*. `reason` is one of
-`quota_exceeded`, `spend_cap_exceeded` or `arithmetic_overflow`.
+`quota_exceeded`, `spend_cap_exceeded` or `usage_unrepresentable` - the same
+codes the sidecar returns over HTTP, so moving between the two does not change
+what you branch on.
 
 ## FastMCP
 
