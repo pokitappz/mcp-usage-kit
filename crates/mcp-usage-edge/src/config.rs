@@ -98,6 +98,18 @@ pub enum ConfigError {
     /// A zero-length challenge lifetime.
     #[error("mpp.challenge_ttl_seconds must be greater than zero")]
     ZeroChallengeTtl,
+    /// `task_store.url_env` named a variable that is unset or empty.
+    #[error("the task store reads its URL from ${0}, which is unset or empty")]
+    TaskStoreUrlMissing(String),
+    /// A zero-length task attribution lifetime.
+    #[error("task_store.ttl_seconds must be greater than zero")]
+    ZeroTaskTtl,
+    /// A task store was configured into a build without the feature.
+    #[error(
+        "[task_store] needs the `redis` feature; rebuild with --features redis \
+         or remove the section"
+    )]
+    TaskStoreUnsupported,
 }
 
 /// A parsed sidecar configuration.
@@ -123,6 +135,75 @@ pub struct Config {
     /// Accept MPP payment instead of refusing an over-quota call.
     #[serde(default)]
     pub mpp: Option<MppSettings>,
+    /// Where durable-task attribution is kept.
+    #[serde(default)]
+    pub task_store: Option<TaskStoreSettings>,
+}
+
+/// A shared store for durable-task attribution.
+///
+/// A `tools/call` that creates a task and the `tasks/get` that completes it are
+/// separate requests and may land on different instances. The default store is
+/// process-local, so without a shared one the completing poll finds no
+/// attribution and the task is billed nothing at all. Behind a load balancer
+/// that loses roughly `1 - 1/N` of durable-task revenue.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskStoreSettings {
+    /// Environment variable holding the Redis connection URL.
+    pub url_env: String,
+    /// Key prefix, so one Redis can serve several deployments.
+    #[serde(default = "default_task_key_prefix")]
+    pub key_prefix: String,
+    /// How long an unfinished task's attribution is kept.
+    ///
+    /// Must outlive the longest task the upstream can run: an attribution that
+    /// expires before its task completes bills nothing, with no signal beyond
+    /// a free verdict.
+    #[serde(default = "default_task_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// Bound on connection and command operations.
+    #[serde(default = "default_task_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_task_key_prefix() -> String {
+    "mcp-usage".to_owned()
+}
+
+const fn default_task_ttl_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+const fn default_task_timeout_seconds() -> u64 {
+    2
+}
+
+impl TaskStoreSettings {
+    /// How long an unfinished task's attribution is kept.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl_seconds)
+    }
+
+    /// Bound on connection and command operations.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_seconds)
+    }
+
+    /// Resolve the connection URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::TaskStoreUrlMissing`] when the variable is unset
+    /// or empty.
+    pub fn url(&self) -> Result<String, ConfigError> {
+        std::env::var(&self.url_env)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ConfigError::TaskStoreUrlMissing(self.url_env.clone()))
+    }
 }
 
 /// The "Payment" HTTP authentication scheme, as this sidecar offers it.
@@ -613,6 +694,17 @@ impl Config {
                 return Err(ConfigError::FacilitatorUrl(mpp.facilitator.url.clone()));
             }
         }
+
+        if let Some(store) = &self.task_store {
+            if store.ttl_seconds == 0 {
+                return Err(ConfigError::ZeroTaskTtl);
+            }
+            // Refused loudly rather than ignored. A sidecar that silently fell
+            // back to the process-local store would look configured while
+            // losing every durable-task charge in a multi-instance deployment.
+            #[cfg(not(feature = "redis"))]
+            return Err(ConfigError::TaskStoreUnsupported);
+        }
         Ok(())
     }
 
@@ -751,6 +843,31 @@ url = "http://127.0.0.1:3000"
         let limit = config.edge.auth_failure_limit.expect("present");
         assert_eq!(limit.max_failures, 25);
         assert_eq!(limit.window(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_zero_task_attribution_lifetime_is_refused() {
+        // An attribution that expires before its task completes bills nothing,
+        // with no signal beyond a free verdict.
+        let text = minimal("").replace(
+            "[upstream]",
+            "[task_store]\nurl_env = \"TASK_REDIS_URL\"\nttl_seconds = 0\n\n[upstream]",
+        );
+        let config = parse(&text).expect("parses");
+        assert!(matches!(config.validate(), Err(ConfigError::ZeroTaskTtl)));
+    }
+
+    #[test]
+    fn a_task_store_section_parses_with_its_defaults() {
+        let text = minimal("").replace(
+            "[upstream]",
+            "[task_store]\nurl_env = \"TASK_REDIS_URL\"\n\n[upstream]",
+        );
+        let config = parse(&text).expect("parses");
+        let store = config.task_store.expect("present");
+        assert_eq!(store.key_prefix, "mcp-usage");
+        assert_eq!(store.ttl(), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(store.timeout(), Duration::from_secs(2));
     }
 
     #[test]

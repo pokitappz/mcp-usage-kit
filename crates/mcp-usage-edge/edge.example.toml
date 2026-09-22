@@ -100,6 +100,23 @@ flush_interval_seconds = 10
 # token_env = "MPP_FACILITATOR_TOKEN"
 # timeout_seconds = 20
 
+# Where durable-task attribution is kept. A `tools/call` that creates a task
+# and the `tasks/get` that completes it are separate requests and may land on
+# different instances; the default store is process-local, so without a shared
+# one the completing poll finds no attribution and the task is billed nothing.
+# Behind a load balancer that loses roughly 1 - 1/N of durable-task revenue.
+#
+# Needs the `redis` feature. A section here in a build without it is refused
+# rather than ignored, so a misconfigured sidecar cannot look fine while
+# silently losing charges.
+#
+# [task_store]
+# url_env = "TASK_REDIS_URL"
+# key_prefix = "mcp-usage"
+# # Must outlive the longest task the upstream can run.
+# ttl_seconds = 86400
+# timeout_seconds = 2
+
 # One table per tenant. Keys are looked up by digest and never stored in plain
 # text at rest by the meter, but this file holds them, so prefer api_key_env.
 # Quota and spend caps are NOT available with a static table, because they need

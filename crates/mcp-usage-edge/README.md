@@ -213,6 +213,19 @@ and is metered exactly like a prepaid one.
 - **Single-instance replay protection.** Spent proofs are remembered in
   process. A horizontally scaled deployment needs a shared store, the same way
   durable task attribution does.
+
+## Running more than one instance
+
+Durable-task attribution defaults to a process-local store. A `tools/call` that
+creates a task and the `tasks/get` that completes it are separate requests, so
+behind a load balancer the completing poll usually lands elsewhere, finds no
+attribution, and the task is billed **nothing**. Roughly `1 - 1/N` of
+durable-task revenue disappears, reported only as a free verdict.
+
+Configure `[task_store]` and build with `--features redis` to share it. A
+`[task_store]` section in a build without the feature is refused at startup
+rather than ignored, so a misconfigured sidecar cannot look fine while quietly
+losing charges.
 - **No in-process context.** The sidecar sees the MCP wire protocol and nothing
   else. An application that wants to price on its own internal state should
   embed `mcp-usage-kit` directly.

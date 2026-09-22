@@ -24,6 +24,12 @@ default = ["tls"]
 # Upstreams reached over https. Off by default in tests and for sidecars that
 # talk to a loopback or private-network upstream, which is the common shape.
 tls = ["dep:hyper-rustls", "dep:rustls"]
+# A shared durable task store. Without one, a durable task created on one
+# sidecar and completed on another is never billed, so any deployment running
+# more than a single instance loses that revenue. Redis rather than Postgres
+# because a sidecar should not drag SQLx in; an application that already has a
+# pool can embed the library and pass `PostgresTaskStore` directly.
+redis = ["mcp-usage-kit/redis"]
 
 [dependencies]
 mcp-usage-kit = { workspace = true }
