@@ -1,6 +1,6 @@
 # Release guide
 
-All five crates share one version and are released together in dependency order.
+All six crates share one version and are released together in dependency order.
 
 A repository administrator must apply the checked-in GitHub control baseline
 once, and after any intentional CI job-name change:
@@ -31,14 +31,20 @@ Administration write permission.
 
 ## First release
 
-**All five crates have been published since v0.3.0**, so this section no longer
-applies to an ordinary release; see "Later releases" below. It is kept for
-reference, and for any crate added to the workspace later, which would be
-unpublished and would need this path for its own first version. Confirm the
-current state with:
+**`mcp-usage-edge` has never been published.** It was added to the workspace
+and to `scripts/publish-crates.sh` after v0.3.1, so the next release needs this
+section, not "Later releases". The other five have been published since v0.3.0.
+
+Publishing the six together without doing this first is the failure the release
+workflow's "Refuse a first release" step exists to stop: trusted publishing
+needs a trusted publisher, which can only be configured against a crate that
+already exists, so `mcp-usage-edge` would fail at authentication *after* the
+other five had already been published at the new version and could not be
+published again. Confirm the current state with:
 
 ```sh
-for c in mcp-usage-core mcp-usage-export mcp-usage-tower mcp-usage-store mcp-usage-kit; do
+for c in mcp-usage-core mcp-usage-export mcp-usage-tower mcp-usage-store \
+         mcp-usage-kit mcp-usage-edge; do
   cargo info "$c" >/dev/null 2>&1 && echo "$c is published" || echo "$c is unpublished"
 done
 ```

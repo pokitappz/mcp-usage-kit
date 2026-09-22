@@ -28,7 +28,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "mcp-usage-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "serde",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-python"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "mcp-usage-core",
  "pyo3",

@@ -48,8 +48,13 @@ jobs:
       - name: Refuse a first release
         run: |
           unpublished=""
+          # Every crate `scripts/publish-crates.sh` publishes has to be
+          # listed here, or the guard passes and the publish still half
+          # succeeds. `mcp-usage-edge` was added to that script and not to
+          # this list, which is the exact shape of the accident this step
+          # exists to prevent.
           for crate in mcp-usage-core mcp-usage-export mcp-usage-tower \
-                       mcp-usage-store mcp-usage-kit; do
+                       mcp-usage-store mcp-usage-kit mcp-usage-edge; do
             # From inside the workspace `cargo info` answers from the local
             # path and reports every crate as present, so this has to ask the
             # registry from somewhere the workspace cannot satisfy it.
