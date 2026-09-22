@@ -25,9 +25,13 @@ cargo add mcp-usage-kit
 - `mcp-usage-store` - atomic Redis, Valkey, and PostgreSQL task attribution for
   horizontally scaled servers.
 - `mcp-usage-kit` - the public facade and runnable `rmcp` example.
+- `mcp-usage-edge` - a metering sidecar that fronts an MCP server written in any
+  language.
+- `mcp-overbilling` - measures how much a request-counting meter overbills real
+  MCP traffic. Not published; it is a measurement harness, not a dependency.
 
-The repository contains the embeddable crates only. It does not include a
-hosted control plane or reverse proxy.
+The repository contains the embeddable crates and the sidecar. It does not
+include a hosted control plane.
 
 ## The billing rule
 
@@ -126,6 +130,35 @@ Machine-readable versioned test vectors live under
 [`mcp-usage-core/conformance`](crates/mcp-usage-core/conformance/v1/cases.json).
 They are independent of Rust and can be reused by gateways and servers in other
 languages.
+
+## Does this actually matter?
+
+The table above says request counting is the wrong unit. That is a measurable
+claim, so it is measured:
+
+```sh
+cargo run -p mcp-overbilling
+```
+
+Identical MCP traffic, billed two ways. Against the strongest version of a
+request counter - one that reads `Mcp-Name` and applies your own price book per
+request, and is blind only to what came back:
+
+| | HTTP requests | Correct | Request counting |
+|---|---:|---:|---:|
+| Discovery | 7 | 0 | 7 |
+| Multi-round-trip | 8 | 35 | 155 |
+| Task polling | 12 | 40 | 80 |
+| Errors | 9 | 5 | 135 |
+| Retries | 9 | 72 | 76 |
+| **Total** | **45** | **152** | **453** |
+
+**2.98x the correct invoice.** The suite holds this project to the same
+standard: every scenario declares what *should* be billed and why, and CI fails
+if terminal-delivery metering drifts from it. It also contains traffic where
+request counting is correct, because a comparison built only from cases that
+favour one answer is not evidence. See
+[`mcp-overbilling`](crates/mcp-overbilling/README.md).
 
 ## Security and operational bounds
 

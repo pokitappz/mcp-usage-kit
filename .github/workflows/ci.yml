@@ -38,6 +38,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --workspace --all-features --no-deps --locked
+      # The overbilling numbers are published, so they have to keep being
+      # reproducible. `--strict` fails when this project's own meter drifts
+      # from the ground truth the suite claims is correct, which is the half of
+      # it that holds us to the same standard as everyone else.
+      - name: Reproduce the published overbilling measurement
+        run: cargo +stable run --locked -p mcp-overbilling -- --strict
       - name: Build publishable archives
         run: cargo +stable package --workspace --locked --no-verify
       - name: Test release metadata guards

@@ -1,0 +1,23 @@
+[package]
+name = "mcp-overbilling"
+description = "Measures how much a request-counting meter overbills real MCP traffic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Deliberately not published. It is a measurement harness, not a library
+# anything depends on, and every crate in `scripts/publish-crates.sh` has to be
+# mirrored in the release workflow's first-release guard; adding one that
+# nobody imports is cost without benefit.
+publish = false
+
+[[bin]]
+name = "mcp-overbilling"
+path = "src/main.rs"
+
+[dependencies]
+mcp-usage-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

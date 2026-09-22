@@ -7,6 +7,7 @@ members = [
     "crates/mcp-usage-tower",
     "crates/mcp-usage-store",
     "crates/mcp-usage-edge",
+    "crates/mcp-overbilling",
 ]
 
 # The Python extension is deliberately NOT a workspace member. With PyO3's

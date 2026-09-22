@@ -1,0 +1,237 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    {
+      "id": "discovery-handshake",
+      "category": "discovery",
+      "title": "An agent connects and finds out what the server offers",
+      "why": "Four requests before any work is asked for. A request counter invoices the introduction.",
+      "flatUnits": 1,
+      "namedUnits": {},
+      "groundTruthUnits": 0,
+      "groundTruthRationale": "Nothing was delivered. The client asked what exists and the server answered. Charging here bills the cost of connecting, which every client pays on every reconnect, so it scales with flaky networks rather than with value.",
+      "exchanges": [
+        {
+          "method": "server/discover",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "complete", "serverInfo": { "name": "acme" } } }
+        },
+        {
+          "method": "tools/list",
+          "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "complete", "tools": [] } }
+        },
+        {
+          "method": "resources/list",
+          "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "resources": [] } }
+        },
+        {
+          "method": "prompts/list",
+          "response": { "jsonrpc": "2.0", "id": 4, "result": { "resultType": "complete", "prompts": [] } }
+        }
+      ]
+    },
+    {
+      "id": "discovery-reconnect-storm",
+      "category": "discovery",
+      "title": "A flaky client reconnects three times in a session",
+      "why": "Each reconnect re-lists. The invoice grows with connection quality, not with work done.",
+      "flatUnits": 1,
+      "namedUnits": {},
+      "groundTruthUnits": 0,
+      "groundTruthRationale": "Still nothing delivered. This is the same introduction three times because the socket dropped, which is a property of the customer's network and not of what the server did for them.",
+      "exchanges": [
+        { "method": "tools/list", "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "complete", "tools": [] } } },
+        { "method": "tools/list", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "complete", "tools": [] } } },
+        { "method": "tools/list", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "tools": [] } } }
+      ]
+    },
+    {
+      "id": "elicitation-round-trip",
+      "category": "multi_round_trip",
+      "title": "One booking that stops to ask which fare the user wants",
+      "why": "Three requests, one booking. The two interim turns delivered a question, not a flight.",
+      "flatUnits": 1,
+      "namedUnits": { "book_flight": 10 },
+      "groundTruthUnits": 10,
+      "groundTruthRationale": "One flight was booked, at the price of book_flight. The interim input_required turns delivered nothing the customer can use; billing them charges the customer for the server's own need to ask a follow-up question.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "book_flight",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "input_required", "message": "Which fare?" } }
+        },
+        {
+          "method": "tools/call",
+          "name": "book_flight",
+          "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "input_required", "message": "Confirm the seat?" } }
+        },
+        {
+          "method": "tools/call",
+          "name": "book_flight",
+          "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "content": [] } }
+        }
+      ]
+    },
+    {
+      "id": "sampling-heavy-analysis",
+      "category": "multi_round_trip",
+      "title": "An analysis tool that comes back for more input four times",
+      "why": "Five requests, one analysis. Interactivity multiplies the bill under request counting.",
+      "flatUnits": 1,
+      "namedUnits": { "analyze_portfolio": 25 },
+      "groundTruthUnits": 25,
+      "groundTruthRationale": "One analysis was delivered. A tool that converses to do its job is not doing five times the work of one that guesses; under request counting the more careful tool is the more expensive one, which prices the wrong behaviour.",
+      "exchanges": [
+        { "method": "tools/call", "name": "analyze_portfolio", "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "input_required" } } },
+        { "method": "tools/call", "name": "analyze_portfolio", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "input_required" } } },
+        { "method": "tools/call", "name": "analyze_portfolio", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "input_required" } } },
+        { "method": "tools/call", "name": "analyze_portfolio", "response": { "jsonrpc": "2.0", "id": 4, "result": { "resultType": "input_required" } } },
+        { "method": "tools/call", "name": "analyze_portfolio", "response": { "jsonrpc": "2.0", "id": 5, "result": { "resultType": "complete", "content": [] } } }
+      ]
+    },
+    {
+      "id": "durable-task-polled-to-completion",
+      "category": "task_polling",
+      "title": "A long report, polled every few seconds until it is ready",
+      "why": "Eight requests, one report. The poll interval is the client's choice, so the client sets the invoice.",
+      "flatUnits": 1,
+      "namedUnits": { "generate_report": 40 },
+      "groundTruthUnits": 40,
+      "groundTruthRationale": "One report was generated, priced by the call that commissioned it rather than by tasks/get, which carries no name. Every poll before the last one delivered a status. A client polling twice as fast is not buying twice as much.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "generate_report",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } }
+        },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 4, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 5, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 6, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 7, "result": { "resultType": "task", "taskId": "task-1", "status": "working" } } },
+        {
+          "method": "tasks/get",
+          "response": { "jsonrpc": "2.0", "id": 8, "result": { "resultType": "complete", "taskId": "task-1", "status": "completed", "content": [] } }
+        }
+      ]
+    },
+    {
+      "id": "task-cancelled-before-delivery",
+      "category": "task_polling",
+      "title": "A task the user cancels while it is still running",
+      "why": "Four requests and nothing was ever delivered.",
+      "flatUnits": 1,
+      "namedUnits": { "bulk_import": 30 },
+      "groundTruthUnits": 0,
+      "groundTruthRationale": "The import never finished, so the customer received nothing. Charging for started-then-cancelled work bills intent rather than delivery, and the cancel request itself is the customer telling you to stop.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "bulk_import",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "task", "taskId": "task-2", "status": "working" } }
+        },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "task", "taskId": "task-2", "status": "working" } } },
+        { "method": "tasks/cancel", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "task", "taskId": "task-2", "status": "cancelled" } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 4, "result": { "resultType": "task", "taskId": "task-2", "status": "cancelled" } } }
+      ]
+    },
+    {
+      "id": "server-error-then-retry",
+      "category": "errors",
+      "title": "The server fails twice, then succeeds",
+      "why": "Three requests, one delivery. Request counting bills the customer for the server's own outage.",
+      "flatUnits": 1,
+      "namedUnits": { "lookup_customer": 5 },
+      "groundTruthUnits": 5,
+      "groundTruthRationale": "One lookup was delivered. The two failures were the server not working; billing them means an unreliable server earns more than a reliable one, which is the incentive pointed exactly the wrong way.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "lookup_customer",
+          "response": { "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "upstream timeout" } }
+        },
+        {
+          "method": "tools/call",
+          "name": "lookup_customer",
+          "response": { "jsonrpc": "2.0", "id": 2, "error": { "code": -32603, "message": "upstream timeout" } }
+        },
+        {
+          "method": "tools/call",
+          "name": "lookup_customer",
+          "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "content": [] } }
+        }
+      ]
+    },
+    {
+      "id": "agent-retry-loop-on-bad-arguments",
+      "category": "errors",
+      "title": "An agent retries a malformed call six times and gives up",
+      "why": "Six requests, nothing delivered. A looping agent is a billing event under request counting.",
+      "flatUnits": 1,
+      "namedUnits": { "create_order": 20 },
+      "groundTruthUnits": 0,
+      "groundTruthRationale": "No order was created. This is the failure mode that makes customers distrust agent pricing: a loop they did not intend produces an invoice they cannot explain, for work that never happened.",
+      "exchanges": [
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 1, "error": { "code": -32602, "message": "invalid params" } } },
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 2, "error": { "code": -32602, "message": "invalid params" } } },
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 3, "error": { "code": -32602, "message": "invalid params" } } },
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 4, "error": { "code": -32602, "message": "invalid params" } } },
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 5, "error": { "code": -32602, "message": "invalid params" } } },
+        { "method": "tools/call", "name": "create_order", "response": { "jsonrpc": "2.0", "id": 6, "error": { "code": -32602, "message": "invalid params" } } }
+      ]
+    },
+    {
+      "id": "terminal-task-polled-after-completion",
+      "category": "retries",
+      "title": "A finished task polled three more times",
+      "why": "The same completed result, re-observed. Request counting invoices each look.",
+      "flatUnits": 1,
+      "namedUnits": { "render_video": 60 },
+      "groundTruthUnits": 60,
+      "groundTruthRationale": "One video was rendered. A terminal task keeps reporting completed to every later poll, so without an idempotency key on the task id the same delivery is invoiced once per look - and a client that caches badly pays more than one that caches well.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "render_video",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "task", "taskId": "task-3", "status": "working" } }
+        },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "complete", "taskId": "task-3", "status": "completed", "content": [] } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "taskId": "task-3", "status": "completed", "content": [] } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 4, "result": { "resultType": "complete", "taskId": "task-3", "status": "completed", "content": [] } } },
+        { "method": "tasks/get", "response": { "jsonrpc": "2.0", "id": 5, "result": { "resultType": "complete", "taskId": "task-3", "status": "completed", "content": [] } } }
+      ]
+    },
+    {
+      "id": "ordinary-billable-call",
+      "category": "retries",
+      "title": "A plain tool call that works first time",
+      "why": "Nothing to disagree about. Both meters should charge the same, and a suite that only contains traffic favouring one answer is not evidence.",
+      "flatUnits": 1,
+      "namedUnits": { "search": 3 },
+      "groundTruthUnits": 3,
+      "groundTruthRationale": "One search delivered, one charge. This is the case request counting gets right, and it is in the suite so the totals are not built only from traffic chosen to make the point.",
+      "exchanges": [
+        {
+          "method": "tools/call",
+          "name": "search",
+          "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "complete", "content": [] } }
+        }
+      ]
+    },
+    {
+      "id": "three-ordinary-calls",
+      "category": "retries",
+      "title": "Three straightforward calls in a row",
+      "why": "Also nothing to disagree about, at a price above one unit, so the comparison is not an artefact of flat pricing.",
+      "flatUnits": 1,
+      "namedUnits": { "search": 3 },
+      "groundTruthUnits": 9,
+      "groundTruthRationale": "Three searches delivered at three units each. Included because a request counter charging one unit per request would look correct on a one-unit price book by coincidence; here the two answers differ for the ordinary case too, which is the more honest comparison.",
+      "exchanges": [
+        { "method": "tools/call", "name": "search", "response": { "jsonrpc": "2.0", "id": 1, "result": { "resultType": "complete", "content": [] } } },
+        { "method": "tools/call", "name": "search", "response": { "jsonrpc": "2.0", "id": 2, "result": { "resultType": "complete", "content": [] } } },
+        { "method": "tools/call", "name": "search", "response": { "jsonrpc": "2.0", "id": 3, "result": { "resultType": "complete", "content": [] } } }
+      ]
+    }
+  ]
+}
