@@ -30,7 +30,7 @@ pub use classify::{ClassificationError, ProtocolHeaders, classify_protocol_heade
 pub use deferred::DeferredCompletions;
 pub use layer::{EdgeConfig, EdgeConfigError, MeterBody, MeterLayer, MeterService};
 pub use mcp_usage_core::{TaskAttribution, TaskOriginKind};
-pub use metrics::{EdgeMetrics, MetricsSnapshot};
+pub use metrics::{EdgeMetrics, MetricsSnapshot, UnaccountedReason};
 #[cfg(feature = "opentelemetry")]
 pub use opentelemetry_metrics::{OpenTelemetryMetrics, install_opentelemetry};
 pub use task::{InMemoryTaskStore, TaskAttributionStore, TaskStoreError, TaskStoreFuture};

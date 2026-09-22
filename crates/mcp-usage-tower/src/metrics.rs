@@ -7,6 +7,66 @@ use mcp_usage_core::FreeReason;
 /// One counter slot per [`FreeReason`].
 const REASONS: usize = FreeReason::ALL.len();
 
+/// One counter slot per [`UnaccountedReason`].
+const UNACCOUNTED: usize = UnaccountedReason::ALL.len();
+
+/// Why a response the edge observed produced no accounting at all.
+///
+/// Four unrelated causes shared one counter, so an operator watching
+/// `mcp_usage_unrecognized_responses_total` climb could tell that responses
+/// were going unaccounted and nothing about why. They need opposite responses:
+/// a media type means the origin is misconfigured and revenue is being lost, a
+/// capture overflow means the capture bound is set too low for this traffic,
+/// and a task-id mismatch means the origin answered the wrong question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaccountedReason {
+    /// The origin declared a media type the meter does not read as MCP.
+    MediaType,
+    /// The body was read but was not a JSON-RPC response.
+    Unparseable,
+    /// A `tasks/get` was answered with a different task than it asked for.
+    TaskIdMismatch,
+    /// The captured body exceeded the configured capture bound, so the
+    /// terminal result was never seen.
+    Oversized,
+}
+
+impl UnaccountedReason {
+    /// Every reason, in a stable order.
+    ///
+    /// Callers index metric slots by position, so appending is safe and
+    /// reordering is not.
+    pub const ALL: [Self; 4] = [
+        Self::MediaType,
+        Self::Unparseable,
+        Self::TaskIdMismatch,
+        Self::Oversized,
+    ];
+
+    /// The stable wire name, written out so renaming a variant cannot silently
+    /// change what an operator's dashboard is keyed on.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MediaType => "media_type",
+            Self::Unparseable => "unparseable",
+            Self::TaskIdMismatch => "task_id_mismatch",
+            Self::Oversized => "oversized",
+        }
+    }
+
+    /// Position in [`Self::ALL`], and so in the metric slots.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::MediaType => 0,
+            Self::Unparseable => 1,
+            Self::TaskIdMismatch => 2,
+            Self::Oversized => 3,
+        }
+    }
+}
+
 /// Process-local edge counters.
 #[derive(Debug, Default)]
 pub struct EdgeMetrics {
@@ -24,6 +84,7 @@ pub struct EdgeMetrics {
     record_failures: AtomicU64,
     deferred: AtomicU64,
     unrecognized_responses: AtomicU64,
+    unrecognized_by_reason: [AtomicU64; UNACCOUNTED],
 }
 
 /// Point-in-time metric values.
@@ -65,6 +126,9 @@ pub struct MetricsSnapshot {
     pub deferred: u64,
     /// Bodies that ended without a parseable terminal response.
     pub unrecognized_responses: u64,
+    /// Unaccounted responses split by cause, indexed by
+    /// [`UnaccountedReason::index`].
+    pub unrecognized_by_reason: [u64; UNACCOUNTED],
 }
 
 impl EdgeMetrics {
@@ -103,8 +167,9 @@ impl EdgeMetrics {
     pub(crate) fn deferred(&self) {
         saturating_add(&self.deferred, 1);
     }
-    pub(crate) fn unrecognized_response(&self) {
+    pub(crate) fn unrecognized_response(&self, reason: UnaccountedReason) {
         saturating_add(&self.unrecognized_responses, 1);
+        saturating_add(&self.unrecognized_by_reason[reason.index()], 1);
     }
 
     /// Read every counter using relaxed ordering.
@@ -127,15 +192,19 @@ impl EdgeMetrics {
             record_failures: self.record_failures.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
             unrecognized_responses: self.unrecognized_responses.load(Ordering::Relaxed),
+            unrecognized_by_reason: std::array::from_fn(|slot| {
+                self.unrecognized_by_reason[slot].load(Ordering::Relaxed)
+            }),
         }
     }
 
     /// Render all counters in the Prometheus text exposition format.
     ///
-    /// Metric names and help strings are fixed. The only label is `reason` on
-    /// the free-delivery breakdown, whose values come from the closed
-    /// [`FreeReason`] enum. Nothing carries a tenant, customer, method, or tool
-    /// label, which keeps cardinality and privacy risk bounded.
+    /// Metric names and help strings are fixed. The only label is `reason`, on
+    /// the two breakdowns, and its values come from the closed [`FreeReason`]
+    /// and [`UnaccountedReason`] enums. Nothing carries a tenant, customer,
+    /// method, or tool label, which keeps cardinality and privacy risk
+    /// bounded.
     #[must_use]
     pub fn render_prometheus(&self) -> String {
         self.snapshot().render_prometheus()
@@ -146,7 +215,7 @@ impl MetricsSnapshot {
     /// Render this snapshot in the Prometheus text exposition format.
     #[must_use]
     pub fn render_prometheus(self) -> String {
-        let mut output = String::with_capacity(2_400);
+        let mut output = String::with_capacity(3_000);
         append_metric(
             &mut output,
             "mcp_usage_classified_total",
@@ -234,6 +303,15 @@ impl MetricsSnapshot {
             "Bodies that ended without a recognized terminal MCP response.",
             self.unrecognized_responses,
         );
+        append_labelled_metric(
+            &mut output,
+            "mcp_usage_unrecognized_responses_by_reason_total",
+            "Bodies that ended without a recognized terminal MCP response, split by cause.",
+            "reason",
+            UnaccountedReason::ALL
+                .iter()
+                .map(|reason| (reason.as_str(), self.unrecognized_by_reason[reason.index()])),
+        );
         output
     }
 }
@@ -303,6 +381,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_unaccounted_reason_has_a_distinct_name_and_a_matching_index() {
+        let mut names = std::collections::HashSet::new();
+        for (slot, reason) in UnaccountedReason::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), slot, "{reason:?} indexes the wrong slot");
+            assert!(names.insert(reason.as_str()), "{reason:?} reuses a name");
+        }
+        assert_eq!(names.len(), UNACCOUNTED);
+    }
+
+    #[test]
     fn counters_saturate_instead_of_wrapping() {
         let counter = AtomicU64::new(u64::MAX - 1);
         saturating_add(&counter, 10);
@@ -322,7 +410,9 @@ mod tests {
         // the enum. Anything else appearing here is unbounded cardinality.
         for line in output.lines().filter(|line| line.contains('{')) {
             assert!(
-                line.starts_with("mcp_usage_free_deliveries_by_reason_total{reason=\""),
+                line.starts_with("mcp_usage_free_deliveries_by_reason_total{reason=\"")
+                    || line
+                        .starts_with("mcp_usage_unrecognized_responses_by_reason_total{reason=\""),
                 "unexpected labelled series: {line}"
             );
         }
@@ -354,6 +444,34 @@ mod tests {
     }
 
     #[test]
+    fn unaccounted_responses_are_counted_against_their_own_cause() {
+        let metrics = EdgeMetrics::default();
+        metrics.unrecognized_response(UnaccountedReason::MediaType);
+        metrics.unrecognized_response(UnaccountedReason::MediaType);
+        metrics.unrecognized_response(UnaccountedReason::Oversized);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.unrecognized_responses, 3);
+        assert_eq!(
+            snapshot.unrecognized_by_reason[UnaccountedReason::MediaType.index()],
+            2
+        );
+        assert_eq!(
+            snapshot.unrecognized_by_reason[UnaccountedReason::Oversized.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.unrecognized_by_reason.iter().sum::<u64>(),
+            snapshot.unrecognized_responses
+        );
+
+        let output = snapshot.render_prometheus();
+        assert!(output.contains(
+            "mcp_usage_unrecognized_responses_by_reason_total{reason=\"media_type\"} 2\n"
+        ));
+    }
+
+    #[test]
     fn every_reason_is_scraped_even_before_it_fires() {
         // A reason missing from the exposition until its first occurrence makes
         // `rate(...)` on it fail exactly when an operator first goes looking.
@@ -361,6 +479,13 @@ mod tests {
         for reason in FreeReason::ALL {
             let series = format!(
                 "mcp_usage_free_deliveries_by_reason_total{{reason=\"{}\"}} 0\n",
+                reason.as_str()
+            );
+            assert!(output.contains(&series), "missing zero series for {series}");
+        }
+        for reason in UnaccountedReason::ALL {
+            let series = format!(
+                "mcp_usage_unrecognized_responses_by_reason_total{{reason=\"{}\"}} 0\n",
                 reason.as_str()
             );
             assert!(output.contains(&series), "missing zero series for {series}");

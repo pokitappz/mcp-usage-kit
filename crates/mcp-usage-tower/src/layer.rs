@@ -29,7 +29,7 @@ use crate::cache::{
 };
 use crate::classify::{ClassificationError, classify_protocol_headers};
 use crate::deferred::DeferredCompletions;
-use crate::metrics::EdgeMetrics;
+use crate::metrics::{EdgeMetrics, UnaccountedReason};
 use crate::task::{InMemoryTaskStore, TaskAttributionStore};
 use crate::{METHOD_HEADER, NAME_HEADER, PROTOCOL_VERSION_HEADER};
 
@@ -737,9 +737,12 @@ impl Completion {
         reason = "terminal accounting stays linear so fail-free ordering remains auditable"
     )]
     async fn finish(self, bytes: Bytes) {
-        let Some(body) = terminal_response(&self.content_type, &bytes) else {
-            self.config.metrics.unrecognized_response();
-            return;
+        let body = match terminal_response(&self.content_type, &bytes) {
+            Ok(body) => body,
+            Err(reason) => {
+                self.config.metrics.unrecognized_response(reason);
+                return;
+            }
         };
         let response = mcp_usage_core::peek::response(&body);
         // A legacy server cannot say "complete"; on those revisions a result is the
@@ -761,7 +764,9 @@ impl Completion {
         {
             // Never attribute one task's result to a differently requested
             // task. A conforming origin cannot produce this mismatch.
-            self.config.metrics.unrecognized_response();
+            self.config
+                .metrics
+                .unrecognized_response(UnaccountedReason::TaskIdMismatch);
             return;
         }
 
@@ -940,7 +945,10 @@ impl<B> ObservedBody<B> {
     fn start_completion(&mut self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
         let completion = self.completion.take()?;
         if self.overflowed {
-            completion.config.metrics.unrecognized_response();
+            completion
+                .config
+                .metrics
+                .unrecognized_response(UnaccountedReason::Oversized);
             return None;
         }
         let captured = std::mem::take(&mut self.captured).freeze();
@@ -1065,16 +1073,44 @@ fn is_json_rpc_response(value: &Value) -> bool {
     value.get("result").is_some() || value.get("error").is_some()
 }
 
-pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Value> {
+/// Read the terminal JSON-RPC response out of a body, or say why there is none.
+///
+/// The two failures are not the same event and must not share a counter. A
+/// media type the meter does not read means the origin is misconfigured and
+/// every call through it is billing nothing, which is a revenue incident; a
+/// body that was read and was not a response is the origin answering with
+/// something else, which is not.
+///
+/// # Why an undeclared type is still not read
+///
+/// An origin that sends no `Content-Type`, or one the meter does not
+/// recognize, bills nothing even when the body is a perfectly good JSON-RPC
+/// response. That is deliberate. The meter charges money, and it will not
+/// infer a charge from a body whose sender did not say it was MCP - the
+/// guarantee that an unexpected content type can never carry a charge is worth
+/// more than the calls an out-of-spec origin loses.
+///
+/// What was wrong before was not the refusal but its silence: the refusal
+/// shared one counter with three unrelated causes, so it was invisible.
+/// `mcp_usage_unrecognized_responses_by_reason_total{reason="media_type"}`
+/// isolates it. A nonzero rate there means an origin is misconfigured and its
+/// traffic is billing nothing - alert on it.
+pub(crate) fn terminal_response(
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<Value, UnaccountedReason> {
     if has_media_type(content_type, "application/json") {
         return serde_json::from_slice(bytes)
             .ok()
-            .filter(is_json_rpc_response);
+            .filter(is_json_rpc_response)
+            .ok_or(UnaccountedReason::Unparseable);
     }
     if !has_media_type(content_type, "text/event-stream") {
-        return None;
+        return Err(UnaccountedReason::MediaType);
     }
-    let text = std::str::from_utf8(bytes).ok()?;
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err(UnaccountedReason::Unparseable);
+    };
     // One pass over the borrowed bytes. Normalizing line endings by rewriting
     // the text copied the whole captured body twice, once per `replace`, for
     // every streamed response the meter observed.
@@ -1095,7 +1131,7 @@ pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Valu
         }
     }
     take_terminal(&data, &mut terminal);
-    terminal
+    terminal.ok_or(UnaccountedReason::Unparseable)
 }
 
 /// Keep `data` if it is a JSON-RPC response, replacing any earlier one.
@@ -1174,7 +1210,16 @@ where
 /// Internals reachable from the crate's property tests.
 #[cfg(test)]
 pub(crate) mod testing {
-    pub(crate) use super::terminal_response;
+    use serde_json::Value;
+
+    /// The reader as the totality properties want it: a response, or nothing.
+    ///
+    /// The production reader distinguishes the two ways there can be no
+    /// response so that the metrics can; the totality properties do not care
+    /// which one happened.
+    pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Value> {
+        super::terminal_response(content_type, bytes).ok()
+    }
 }
 
 #[cfg(test)]
@@ -2931,8 +2976,9 @@ mod tests {
             b"{}".as_slice(),
             br#"{"jsonrpc":"2.0","id":1}"#.as_slice(),
         ] {
-            assert!(
-                terminal_response("application/json", body).is_none(),
+            assert_eq!(
+                terminal_response("application/json", body),
+                Err(UnaccountedReason::Unparseable),
                 "{} is not a JSON-RPC response",
                 String::from_utf8_lossy(body)
             );
@@ -2944,14 +2990,73 @@ mod tests {
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}"#,
             )
-            .is_some()
+            .is_ok()
         );
         assert!(
             terminal_response(
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32020}}"#,
             )
-            .is_some()
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_declares_no_media_type_bills_nothing_and_says_so() {
+        // The misconfiguration that costs the most: an origin behind a proxy
+        // that strips headers, or a hand-rolled server that never sets one,
+        // delivering real work and billing zero for all of it. Refusing to
+        // charge is the deliberate policy; being unable to tell that it is
+        // happening was the defect.
+        let config = EdgeConfig::new(task_tenants());
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async move {
+                // A textbook terminal response, with no `Content-Type` at all.
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .body(Full::new(Bytes::from(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {"resultType": "complete", "content": []}
+                            })
+                            .to_string(),
+                        )))
+                        .unwrap(),
+                )
+            }));
+
+        consume(
+            service
+                .oneshot(request(
+                    "tools/call",
+                    Some("long_job"),
+                    &json!({"id": 1, "params": {"name": "long_job"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.billed, 0, "an undeclared body is never charged");
+        assert_eq!(snapshot.unrecognized_responses, 1);
+        assert_eq!(
+            snapshot.unrecognized_by_reason[UnaccountedReason::MediaType.index()],
+            1,
+            "the cause must be attributable to the media type, not to a \
+             capture overflow or an unparseable body"
+        );
+        assert_eq!(
+            snapshot.unrecognized_by_reason[UnaccountedReason::Unparseable.index()],
+            0
+        );
+        assert_eq!(
+            snapshot.unrecognized_by_reason[UnaccountedReason::Oversized.index()],
+            0
         );
     }
 
@@ -2962,7 +3067,22 @@ mod tests {
             "application/json"
         ));
         assert!(!has_media_type("application/jsonp", "application/json"));
-        assert!(terminal_response("application/jsonp", b"{}").is_none());
+
+        // A declared media type the meter does not read is its own cause. An
+        // operator seeing this climb has a misconfigured origin billing
+        // nothing, which is not the same incident as a body that was read and
+        // turned out not to be a response.
+        assert_eq!(
+            terminal_response("application/jsonp", b"{}"),
+            Err(UnaccountedReason::MediaType)
+        );
+        assert!(
+            terminal_response(
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}"#
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]
