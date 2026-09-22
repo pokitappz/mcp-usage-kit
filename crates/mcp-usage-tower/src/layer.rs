@@ -24,7 +24,9 @@ use thiserror::Error;
 use tower::{Layer, Service};
 
 use crate::auth::{AuthFailureLimit, Tenant, TenantStore, hash_api_key};
-use crate::cache::{CachedResponse, RequestMetadata, ResponseCache, cache_hints, inspect_request};
+use crate::cache::{
+    CachedResponse, RequestMetadata, ResponseCache, cache_hints, inspect_request, render_with_id,
+};
 use crate::classify::{ClassificationError, classify_protocol_headers};
 use crate::deferred::DeferredCompletions;
 use crate::metrics::EdgeMetrics;
@@ -432,10 +434,7 @@ where
             };
             let metadata = inspect_request(&protocol.call, &request_bytes);
             if let Some(key) = metadata.cache_key
-                && let Some(cached) =
-                    config
-                        .cache
-                        .get(key, &authorization_context, metadata.request_id.as_ref())
+                && let Some(cached) = config.cache.get(key, &authorization_context)
             {
                 config.metrics.cache_hit();
                 let mut cached_request = metadata;
@@ -446,6 +445,7 @@ where
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_owned();
+                let body = render_with_id(&cached.body, cached_request.request_id.as_ref());
                 let completion = Completion {
                     config,
                     tenant,
@@ -458,7 +458,7 @@ where
                     response_headers: cached.headers.clone(),
                     content_type,
                 };
-                return Ok(cached_response(cached, completion));
+                return Ok(cached_response(&cached, body, completion));
             }
             if metadata.cache_key.is_some() {
                 config.metrics.cache_miss();
@@ -680,10 +680,13 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Met
     response
 }
 
-fn cached_response(cached: CachedResponse, completion: Completion) -> Response<MeterBody> {
-    let body = Bytes::from(cached.body.to_string());
+fn cached_response(
+    cached: &CachedResponse,
+    body: String,
+    completion: Completion,
+) -> Response<MeterBody> {
     let shares_public = completion.config.share_public_cache;
-    let observed = ObservedBody::new(Full::new(body), completion);
+    let observed = ObservedBody::new(Full::new(Bytes::from(body)), completion);
     let mut response = Response::new(
         observed
             .map_err(|never: Infallible| -> BoxError { match never {} })
@@ -691,7 +694,7 @@ fn cached_response(cached: CachedResponse, completion: Completion) -> Response<M
     );
     *response.status_mut() = cached.status;
     *response.version_mut() = cached.version;
-    *response.headers_mut() = cached.headers;
+    *response.headers_mut() = cached.headers.clone();
     let headers = response.headers_mut();
     headers.insert("x-mcp-usage-cache", http::HeaderValue::from_static("hit"));
     headers.insert(
@@ -716,7 +719,7 @@ fn cacheable_headers(headers: &HeaderMap) -> HeaderMap {
 
 struct Completion {
     config: Arc<EdgeConfig>,
-    tenant: Tenant,
+    tenant: Arc<Tenant>,
     authorization_context: String,
     /// The request predated mirrored headers, so its response predates `resultType`.
     legacy: bool,
@@ -1071,27 +1074,63 @@ pub(crate) fn terminal_response(content_type: &str, bytes: &[u8]) -> Option<Valu
     if !has_media_type(content_type, "text/event-stream") {
         return None;
     }
-    let text = std::str::from_utf8(bytes)
-        .ok()?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let text = std::str::from_utf8(bytes).ok()?;
+    // One pass over the borrowed bytes. Normalizing line endings by rewriting
+    // the text copied the whole captured body twice, once per `replace`, for
+    // every streamed response the meter observed.
     let mut terminal = None;
-    for event in text.split("\n\n") {
-        let data = event
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() {
+    let mut data = String::new();
+    for line in sse_lines(text) {
+        if line.is_empty() {
+            // A blank line ends the event.
+            take_terminal(&data, &mut terminal);
+            data.clear();
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(&data)
-            && is_json_rpc_response(&value)
-        {
-            terminal = Some(value);
+        if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim_start());
         }
     }
+    take_terminal(&data, &mut terminal);
     terminal
+}
+
+/// Keep `data` if it is a JSON-RPC response, replacing any earlier one.
+///
+/// The last terminal response in the stream wins, which is what the buffered
+/// implementation did by overwriting as it went.
+fn take_terminal(data: &str, terminal: &mut Option<Value>) {
+    if data.is_empty() {
+        return;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(data)
+        && is_json_rpc_response(&value)
+    {
+        *terminal = Some(value);
+    }
+}
+
+/// Split SSE text on `\n`, `\r\n`, or a bare `\r`.
+///
+/// The wire format treats all three as the same terminator. Yielding borrowed
+/// slices is the point: it is what lets the reader avoid rewriting the body to
+/// normalize it.
+fn sse_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let remaining = rest?;
+        let Some(at) = remaining.find(['\n', '\r']) else {
+            rest = None;
+            return Some(remaining);
+        };
+        let (line, after) = remaining.split_at(at);
+        let terminator = if after.starts_with("\r\n") { 2 } else { 1 };
+        rest = Some(&after[terminator..]);
+        Some(line)
+    })
 }
 
 fn has_media_type(content_type: &str, expected: &str) -> bool {
