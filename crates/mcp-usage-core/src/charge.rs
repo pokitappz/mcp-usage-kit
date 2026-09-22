@@ -186,6 +186,68 @@ pub enum FreeReason {
     UnrecognizedResult,
 }
 
+impl FreeReason {
+    /// Every reason, in a stable order.
+    ///
+    /// Callers index metric slots by position, so appending is safe and
+    /// reordering is not.
+    pub const ALL: [Self; 11] = [
+        Self::Discovery,
+        Self::InterimInputRequired,
+        Self::TaskCreated,
+        Self::TaskInProgress,
+        Self::TaskNotDelivered,
+        Self::TaskDrive,
+        Self::MissingTaskAttribution,
+        Self::MissingTaskId,
+        Self::Subscription,
+        Self::ProtocolError,
+        Self::UnrecognizedResult,
+    ];
+
+    /// The stable wire name.
+    ///
+    /// One spelling per variant, defined here so metrics, bindings and the
+    /// conformance vectors cannot drift into three different answers for the
+    /// same reason. Written out rather than derived from the identifier: a
+    /// rename must not silently change what an operator's dashboard or a
+    /// caller's branch is keyed on.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::InterimInputRequired => "interim_input_required",
+            Self::TaskCreated => "task_created",
+            Self::TaskInProgress => "task_in_progress",
+            Self::TaskNotDelivered => "task_not_delivered",
+            Self::TaskDrive => "task_drive",
+            Self::MissingTaskAttribution => "missing_task_attribution",
+            Self::MissingTaskId => "missing_task_id",
+            Self::Subscription => "subscription",
+            Self::ProtocolError => "protocol_error",
+            Self::UnrecognizedResult => "unrecognized_result",
+        }
+    }
+
+    /// Position in [`Self::ALL`], for indexing a fixed array of counters.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Discovery => 0,
+            Self::InterimInputRequired => 1,
+            Self::TaskCreated => 2,
+            Self::TaskInProgress => 3,
+            Self::TaskNotDelivered => 4,
+            Self::TaskDrive => 5,
+            Self::MissingTaskAttribution => 6,
+            Self::MissingTaskId => 7,
+            Self::Subscription => 8,
+            Self::ProtocolError => 9,
+            Self::UnrecognizedResult => 10,
+        }
+    }
+}
+
 /// The verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Charge {
@@ -356,6 +418,25 @@ fn decide_with_task_pricing(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_reason_has_a_distinct_name_and_a_matching_index() {
+        use super::FreeReason;
+        let mut names: Vec<&str> = FreeReason::ALL.iter().map(|r| r.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two reasons share a wire name");
+
+        for (position, reason) in FreeReason::ALL.iter().enumerate() {
+            assert_eq!(
+                reason.index(),
+                position,
+                "{} indexes a slot that is not its own",
+                reason.as_str()
+            );
+        }
+    }
+
     use super::*;
     use crate::peek::{TaskPeek, response as peek_response};
     use serde_json::json;

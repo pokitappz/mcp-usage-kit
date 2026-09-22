@@ -50,6 +50,10 @@ impl std::fmt::Debug for PostgresTaskStore {
 impl PostgresTaskStore {
     /// Construct a store from an application-owned connection pool.
     ///
+    /// `ttl` must outlive the longest task the upstream server can run, not
+    /// the client's polling interval. A task that outlives it bills zero. See
+    /// the [crate-level notes](crate#choosing-a-ttl).
+    ///
     /// # Errors
     ///
     /// Returns [`StoreConfigError::InvalidTtl`] when the TTL is zero or cannot
@@ -111,6 +115,11 @@ impl PostgresTaskStore {
 
     /// Delete expired task origins and return the affected row count.
     ///
+    /// **The application must call this on a timer.** Unlike Redis, Postgres
+    /// has no native expiry: every read filters on `expires_at`, so nothing is
+    /// served stale, but the rows themselves stay until something deletes
+    /// them and the table otherwise grows without bound.
+    ///
     /// # Errors
     ///
     /// Returns a sanitized backend error.
@@ -144,10 +153,20 @@ impl TaskAttributionStore for PostgresTaskStore {
         Box::pin(async move {
             self.run(
                 sqlx::query(
+                    // `DO NOTHING` would preserve an expired row as if it were
+                    // live. Every read filters on `expires_at`, so that row is
+                    // invisible to `get` and `claim` while still winning the
+                    // conflict: a task id reused after expiry becomes
+                    // permanently unstorable, and every completion of it bills
+                    // nothing. Replacing only an already-expired row keeps the
+                    // first-writer-wins semantics for live ones.
                     "INSERT INTO mcp_usage_task_attribution \
                  (tenant_hash, task_hash, attribution, expires_at) \
                  VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 second')) \
-                 ON CONFLICT (tenant_hash, task_hash) DO NOTHING",
+                 ON CONFLICT (tenant_hash, task_hash) DO UPDATE \
+                 SET attribution = EXCLUDED.attribution, \
+                     expires_at = EXCLUDED.expires_at \
+                 WHERE mcp_usage_task_attribution.expires_at <= NOW()",
                 )
                 .bind(identifier_hash(tenant_id).to_vec())
                 .bind(identifier_hash(task_id).to_vec())
