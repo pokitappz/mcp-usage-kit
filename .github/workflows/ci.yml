@@ -81,9 +81,12 @@ jobs:
           fi
       - name: Install build and test tooling
         run: python3 -m pip install --upgrade 'maturin>=1.9,<2.0' pytest
+      # `--locked` here too, not just on the lint step: without it a stale
+      # bindings/python/Cargo.lock passes CI while the shipped wheel is built
+      # from different versions than the one that was reviewed.
       - name: Build the extension
         working-directory: bindings/python
-        run: maturin build --release --out dist
+        run: maturin build --release --locked --out dist
       - name: Install the built wheel
         working-directory: bindings/python
         run: python3 -m pip install --no-index --find-links dist mcp-usage-kit
@@ -92,6 +95,18 @@ jobs:
       - name: Run the shared conformance vectors and the API suite
         working-directory: bindings/python
         run: python3 -m pytest tests/ -q
+      # The wheel claims abi3-py39, so the floor has to be exercised rather
+      # than assumed: the runner default is well past it. uv is installed
+      # through pip rather than assumed present, and fetches the interpreter
+      # itself, so no unpinned action is added to a workflow that pins.
+      - name: Check the declared Python floor can load the wheel
+        working-directory: bindings/python
+        run: |
+          python3 -m pip install --upgrade uv
+          uv python install 3.9
+          uv run --python 3.9 --with pytest --with mcp-usage-kit \
+            --no-project --find-links dist \
+            python -m pytest tests/ -q
 
   msrv:
     name: Rust 1.88 minimum version

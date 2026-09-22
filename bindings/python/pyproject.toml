@@ -7,6 +7,7 @@ name = "mcp-usage-kit"
 description = "Protocol-correct usage accounting for MCP servers."
 requires-python = ">=3.9"
 license = "Apache-2.0"
+readme = "README.md"
 keywords = ["mcp", "billing", "metering", "fastmcp"]
 classifiers = [
     "Programming Language :: Rust",

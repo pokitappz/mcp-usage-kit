@@ -55,11 +55,17 @@ const fn reason_name(reason: FreeReason) -> &'static str {
     }
 }
 
+/// Stable wire name for a limit rejection.
+///
+/// These must match the codes the sidecar returns over HTTP for the same
+/// variants, or a caller moving from the sidecar to the in-process binding
+/// silently stops matching on them. `usage_unrepresentable` rather than
+/// `arithmetic_overflow` because that is the name already on the wire.
 const fn limit_reason_name(reason: LimitReason) -> &'static str {
     match reason {
         LimitReason::QuotaExceeded => "quota_exceeded",
         LimitReason::SpendCapExceeded => "spend_cap_exceeded",
-        LimitReason::ArithmeticOverflow => "arithmetic_overflow",
+        LimitReason::ArithmeticOverflow => "usage_unrepresentable",
     }
 }
 
@@ -281,6 +287,17 @@ impl Meter {
         name: Option<String>,
         task_origin: Option<(String, Option<String>)>,
     ) -> PyResult<ChargeResult> {
+        // Decoded here rather than left to the caller. The obvious middleware
+        // reads `Mcp-Name` and passes it straight in, and an encoded value
+        // matches nothing in the price book, which silently charges every
+        // non-ASCII-named tool the default instead of its own price.
+        let name = name
+            .map(|name| {
+                core_name::decode(&name)
+                    .map(std::borrow::Cow::into_owned)
+                    .map_err(|error| PyValueError::new_err(format!("invalid tool name: {error}")))
+            })
+            .transpose()?;
         let call = Call::new(Method::parse(method), name);
         let origin = task_origin.map(|(method, name)| Call::new(Method::parse(&method), name));
         let body = to_json(response)?;
@@ -294,7 +311,9 @@ impl Meter {
     /// actually billed still depends on what came back.
     #[pyo3(signature = (method, name = None))]
     fn price(&self, method: &str, name: Option<&str>) -> u64 {
-        self.prices.units_for(&Method::parse(method), name)
+        let decoded = name.and_then(|name| core_name::decode(name).ok());
+        self.prices
+            .units_for(&Method::parse(method), decoded.as_deref())
     }
 
     fn __repr__(&self) -> String {
