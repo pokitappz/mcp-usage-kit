@@ -163,7 +163,29 @@ fn over_quota_snapshot() -> Snapshot {
     .expect("snapshot")
 }
 
+/// A snapshot whose tenant is well inside its cap, so nothing is refused.
+fn in_quota_snapshot() -> Snapshot {
+    serde_json::from_value(serde_json::json!({
+        "tenants": [{
+            "api_key_sha256": hash_api_key(KEY),
+            "tenant_id": "acme",
+            "billing_customer_id": "cus_acme",
+            "prices": {"default_units": 1, "names": {"sum": 7}},
+            "max_units": 10_000,
+            "max_spend_micros": null,
+            "unit_price_micros": 1000,
+            "committed_units": 1,
+            "committed_spend_micros": 1000
+        }]
+    }))
+    .expect("snapshot")
+}
+
 async fn harness(ttl: Duration) -> Harness {
+    harness_with(ttl, over_quota_snapshot(), usize::MAX).await
+}
+
+async fn harness_with(ttl: Duration, snapshot: Snapshot, max_body: usize) -> Harness {
     let facilitator = Facilitator::new();
     let facilitator_addr = spawn_facilitator(facilitator.clone()).await;
     let upstream_headers = Arc::new(Mutex::new(Vec::new()));
@@ -171,7 +193,7 @@ async fn harness(ttl: Duration) -> Harness {
 
     let http = build_client();
     let store = Arc::new(ControlPlaneTenantStore::new(Duration::from_secs(900)));
-    store.apply(over_quota_snapshot());
+    store.apply(snapshot);
 
     let payments = Payments::new(
         PaymentsConfig {
@@ -204,7 +226,8 @@ async fn harness(ttl: Duration) -> Harness {
             .expect("proxy");
     let gate = AdmissionLayer::disabled()
         .with_quota(store)
-        .with_payments(Arc::new(payments));
+        .with_payments(Arc::new(payments))
+        .with_max_body(max_body);
     let service = gate.layer(MeterLayer::new(edge).layer(proxy));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -246,7 +269,27 @@ impl Harness {
         .to_string()
     }
 
+    /// Call one tool while advertising a different priced identity.
+    async fn call_with_name(
+        &self,
+        body_tool: &str,
+        header_tool: &str,
+        credential: Option<&str>,
+    ) -> Answer {
+        self.send(header_tool, credential, Self::body_for(body_tool))
+            .await
+    }
+
+    /// Call with an arbitrary body, for the size limit.
+    async fn call_with_body(&self, tool: &str, credential: Option<&str>, body: String) -> Answer {
+        self.send(tool, credential, body).await
+    }
+
     async fn call(&self, tool: &str, credential: Option<&str>) -> Answer {
+        self.send(tool, credential, Self::body_for(tool)).await
+    }
+
+    async fn send(&self, tool: &str, credential: Option<&str>, body: String) -> Answer {
         let mut builder = Request::builder()
             .method("POST")
             .uri(format!("http://{}/mcp", self.addr))
@@ -259,9 +302,7 @@ impl Harness {
         if let Some(credential) = credential {
             builder = builder.header("payment-authorization", credential);
         }
-        let request = builder
-            .body(Full::new(Bytes::from(Self::body_for(tool))))
-            .expect("request");
+        let request = builder.body(Full::new(Bytes::from(body))).expect("request");
 
         let response = self.client.request(request).await.expect("sidecar answers");
         let status = response.status();
@@ -299,7 +340,7 @@ fn credential(
 ) -> String {
     let mut echo = serde_json::Map::new();
     for key in [
-        "id", "realm", "method", "intent", "request", "expires", "digest", "header",
+        "id", "realm", "method", "intent", "request", "expires", "digest", "opaque", "header",
     ] {
         if let Some(value) = challenge.get(key) {
             echo.insert(key.to_owned(), serde_json::Value::String(value.clone()));
@@ -587,4 +628,79 @@ async fn a_paid_call_is_metered_like_any_other() {
         "the metered identity of the call is unchanged by how it was paid for"
     );
     let _ = MeterEventOutcome::Accepted;
+}
+
+#[tokio::test]
+async fn a_credential_bought_for_a_cheap_call_cannot_redeem_an_expensive_one() {
+    // The digest binds the body, but the amount comes from the priced
+    // identity in the headers. Without binding that identity too, a challenge
+    // taken out under a cheap name would admit an expensive one.
+    let h = harness(Duration::from_secs(300)).await;
+    let cheap = parse_challenge(&h.call("probe", None).await.headers);
+    let paid = credential(&cheap, |_| {});
+
+    // Same body shape, different priced identity on the wire.
+    let answer = h.call_with_name("probe", "sum", Some(&paid)).await;
+
+    assert_eq!(answer.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        problem(&answer),
+        "https://paymentauth.org/problems/invalid-challenge"
+    );
+    assert_eq!(h.facilitator.calls(), 0, "nothing reached settlement");
+}
+
+#[tokio::test]
+async fn the_payment_credential_is_not_forwarded_to_the_upstream() {
+    // It carries the payer's identifier and a settlement proof. The upstream
+    // has no business seeing either, still less logging them.
+    let h = harness(Duration::from_secs(300)).await;
+    let challenge = parse_challenge(&h.call("sum", None).await.headers);
+    h.call("sum", Some(&credential(&challenge, |_| {}))).await;
+
+    let headers = h.upstream_headers.lock().unwrap();
+    let forwarded = headers.last().expect("the upstream was called");
+    assert!(
+        forwarded.get("payment-authorization").is_none(),
+        "the settlement proof must stop at the gate"
+    );
+    // The tenant's own credential still goes through, which is the whole
+    // reason the scheme's `header` parameter exists.
+    assert!(forwarded.get(http::header::AUTHORIZATION).is_some());
+}
+
+#[tokio::test]
+async fn a_spent_credential_does_not_strand_a_tenant_that_is_inside_quota() {
+    // An agent that keeps attaching its last credential is still entitled to
+    // service while it owes nothing. Refusing would strand it.
+    let h = harness_with(Duration::from_secs(300), in_quota_snapshot(), usize::MAX).await;
+
+    let answer = h.call("sum", Some("Payment !!!not-a-credential!!!")).await;
+
+    assert_eq!(
+        answer.status,
+        StatusCode::OK,
+        "a bad credential must not deny service to a tenant in quota"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_refused_before_any_credential_work() {
+    // The limit has to bite while the body is still arriving. Buffering it
+    // all and measuring afterwards lets an unauthenticated client spend the
+    // sidecar's memory before anything checks who they are.
+    let h = harness_with(Duration::from_secs(300), over_quota_snapshot(), 512).await;
+
+    let answer = h.call_with_body("sum", None, "x".repeat(4096)).await;
+
+    assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(h.facilitator.calls(), 0);
+    assert!(h.upstream_headers.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_inside_the_limit_still_passes() {
+    let h = harness_with(Duration::from_secs(300), over_quota_snapshot(), 4096).await;
+    let answer = h.call("sum", None).await;
+    assert_eq!(answer.status, StatusCode::PAYMENT_REQUIRED);
 }
