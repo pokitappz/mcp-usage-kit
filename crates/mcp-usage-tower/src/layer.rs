@@ -742,7 +742,7 @@ impl Completion {
         // A legacy server cannot say "complete"; on those revisions a result is the
         // delivered work. Without this every legacy call would meter as free.
         let response = if self.legacy {
-            response.with_legacy_delivery()
+            response.with_legacy_delivery(&self.call.method)
         } else {
             response
         };
@@ -853,6 +853,25 @@ impl Completion {
             }
             Charge::Free(_) => {
                 self.config.metrics.free();
+                // The claim above already deleted the attribution, on the
+                // assumption that a completed task bills. Some shapes do not:
+                // a `tasks/get` answering with `resultType: "task"` reads as
+                // a task creation and comes back Free. Without putting it
+                // back the charge is destroyed permanently and every later
+                // poll reports a missing attribution.
+                if let (Some(task_id), Some(origin)) = (response_task_id, task_origin)
+                    && let Err(error) = self
+                        .config
+                        .tasks
+                        .insert(&self.tenant.id, task_id, origin)
+                        .await
+                {
+                    self.config.metrics.record_failure();
+                    tracing::error!(
+                        error = %error,
+                        "failed to restore MCP task attribution after a free verdict"
+                    );
+                }
                 if terminal_task
                     && !completed_task
                     && let Some(task_id) = cleanup_task_id
@@ -1555,6 +1574,158 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.billed, 1);
         assert_eq!(snapshot.record_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn a_free_verdict_puts_back_the_attribution_it_claimed() {
+        // The claim deletes the attribution before the verdict is known, on
+        // the assumption that a completed task bills. A `tasks/get` answering
+        // with `resultType: "task"` reads as a task creation and comes back
+        // free, so without a restore the charge is destroyed permanently and
+        // every later poll reports a missing attribution.
+        let tasks = Arc::new(InMemoryTaskStore::new());
+        let config = EdgeConfig::new(task_tenants()).with_task_store(tasks.clone());
+        let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(move |_request: Request<Full<Bytes>>| {
+                let n = stage.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    let result = match n {
+                        0 => json!({"resultType":"task","taskId":"task-1","status":"working"}),
+                        // The odd shape: a task object, reported as one.
+                        1 => json!({"resultType":"task","taskId":"task-1","status":"completed"}),
+                        _ => json!({
+                            "resultType":"complete",
+                            "taskId":"task-1",
+                            "status":"completed",
+                            "result":{}
+                        }),
+                    };
+                    Ok::<_, Infallible>(response(&json!({
+                        "jsonrpc":"2.0","id":n,"result":result
+                    })))
+                }
+            }));
+
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tools/call",
+                    Some("long_job"),
+                    &json!({"id":1,"params":{"name":"long_job"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(tasks.len(), 1, "the creation stored an attribution");
+
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":2,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a free verdict must not consume the attribution"
+        );
+
+        // And the charge is still collectable on a poll the meter understands.
+        release_without_end_of_stream(
+            service
+                .clone()
+                .oneshot(request(
+                    "tasks/get",
+                    None,
+                    &json!({"id":3,"params":{"taskId":"task-1"}}),
+                    "secret",
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(tasks.is_empty(), "the completing poll consumed it");
+    }
+
+    #[tokio::test]
+    async fn an_idle_legacy_client_is_not_billed_for_lifecycle_traffic() {
+        // A legacy request carries no protocol version, so it is classified
+        // from its body. Promoting every bare `result` to a delivery bills
+        // `ping` and `initialize`, which a connected client sends on a timer
+        // forever while doing no work at all. A modern client on identical
+        // traffic is billed nothing, so the bill is not even consistent.
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked("secret", Tenant::new("acme", "cus_acme"));
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                Ok::<_, Infallible>(response(&json!({"jsonrpc":"2.0","id":1,"result":{}})))
+            }));
+
+        for method in [
+            "ping",
+            "initialize",
+            "logging/setLevel",
+            "resources/subscribe",
+        ] {
+            let legacy = Request::builder()
+                .header(crate::API_KEY_HEADER, "secret")
+                .body(Full::new(Bytes::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":method}).to_string(),
+                )))
+                .unwrap();
+            release_without_end_of_stream(service.clone().oneshot(legacy).await.unwrap());
+        }
+
+        assert_eq!(
+            metrics.snapshot().billed,
+            0,
+            "lifecycle traffic must not be billed on the legacy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_tool_call_is_still_billed_after_scoping_the_promotion() {
+        // The regression guard for the fix: scoping the legacy promotion must
+        // not make legacy tool calls free, which is what it exists to prevent.
+        let tenants = Arc::new(InMemoryTenantStore::new());
+        tenants.insert_unchecked(
+            "secret",
+            Tenant::new("acme", "cus_acme").with_prices(PriceBook::flat(4)),
+        );
+        let billing = Arc::new(BillingPipeline::new(CaptureExporter::default()));
+        let config = EdgeConfig::new(tenants).with_recorder(billing.clone());
+        let metrics = config.metrics();
+        let service = ServiceBuilder::new()
+            .layer(MeterLayer::new(config))
+            .service(service_fn(|_request: Request<Full<Bytes>>| async {
+                // No resultType at all, which is the shape the promotion is for.
+                Ok::<_, Infallible>(response(&json!({"jsonrpc":"2.0","id":1,"result":{}})))
+            }));
+
+        let legacy = Request::builder()
+            .header(crate::API_KEY_HEADER, "secret")
+            .body(Full::new(Bytes::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                       "params":{"name":"search"}})
+                .to_string(),
+            )))
+            .unwrap();
+        release_without_end_of_stream(service.oneshot(legacy).await.unwrap());
+
+        assert_eq!(metrics.snapshot().billed, 1);
     }
 
     #[tokio::test]
