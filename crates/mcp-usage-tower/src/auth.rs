@@ -40,7 +40,12 @@ impl Tenant {
 /// Resolves a presented high-entropy API key without retaining its plaintext.
 pub trait TenantStore: Send + Sync {
     /// Return the matching tenant, or `None` for an invalid key.
-    fn authenticate(&self, api_key: &str) -> Option<Tenant>;
+    ///
+    /// Returning an [`Arc`] rather than an owned [`Tenant`] because this runs
+    /// once per request and a [`PriceBook`] is two `BTreeMap`s: handing back a
+    /// value meant deep-copying every priced tool name on every call, for data
+    /// the request only reads.
+    fn authenticate(&self, api_key: &str) -> Option<Arc<Tenant>>;
 }
 
 /// SHA-256 lookup hash for an API key.
@@ -215,7 +220,7 @@ pub fn validate_api_key_strength(api_key: &str) -> Result<(), WeakApiKey> {
 /// Mutable in-memory tenant table for development and embedded deployments.
 #[derive(Clone, Default)]
 pub struct InMemoryTenantStore {
-    by_key_hash: Arc<RwLock<HashMap<String, Tenant>>>,
+    by_key_hash: Arc<RwLock<HashMap<String, Arc<Tenant>>>>,
 }
 
 impl std::fmt::Debug for InMemoryTenantStore {
@@ -259,7 +264,7 @@ impl InMemoryTenantStore {
             .by_key_hash
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tenants.insert(hash_api_key(api_key), tenant);
+        tenants.insert(hash_api_key(api_key), Arc::new(tenant));
     }
 
     /// Number of configured keys.
@@ -279,7 +284,7 @@ impl InMemoryTenantStore {
 }
 
 impl TenantStore for InMemoryTenantStore {
-    fn authenticate(&self, api_key: &str) -> Option<Tenant> {
+    fn authenticate(&self, api_key: &str) -> Option<Arc<Tenant>> {
         self.by_key_hash
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -207,7 +207,7 @@ impl PlaneClient {
 /// What the cache holds for one key.
 #[derive(Debug, Clone)]
 struct Cached {
-    tenant: Tenant,
+    tenant: Arc<Tenant>,
     limits: Limits,
     committed: Usage,
     unit_price_micros: u64,
@@ -276,8 +276,10 @@ impl ControlPlaneTenantStore {
             .into_iter()
             .map(|entry| {
                 let cached = Cached {
-                    tenant: Tenant::new(entry.tenant_id, entry.billing_customer_id)
-                        .with_prices(entry.prices),
+                    tenant: Arc::new(
+                        Tenant::new(entry.tenant_id, entry.billing_customer_id)
+                            .with_prices(entry.prices),
+                    ),
                     limits: Limits {
                         max_units: entry.max_units,
                         max_spend_micros: entry.max_spend_micros,
@@ -292,12 +294,19 @@ impl ControlPlaneTenantStore {
             })
             .collect();
 
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entries = entries;
-        state.refreshed_at = Some(Instant::now());
+        let replaced = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.refreshed_at = Some(Instant::now());
+            std::mem::replace(&mut state.entries, entries)
+        };
+        // Freeing the previous snapshot means dropping a string and a price
+        // book per key. Assigning over the field ran that inside the write
+        // lock, so every refresh stalled the authentication path for as long as
+        // the deallocations took, which scales with the tenant count.
+        drop(replaced);
     }
 
     /// Whether the cache is too old to be trusted.
@@ -314,7 +323,7 @@ impl ControlPlaneTenantStore {
     /// the request is being refused and only needs the price book. Admission
     /// itself goes through [`Self::quota_for`], which does check staleness.
     #[must_use]
-    pub fn tenant_for(&self, api_key: &str) -> Option<Tenant> {
+    pub fn tenant_for(&self, api_key: &str) -> Option<Arc<Tenant>> {
         self.read()
             .entries
             .get(&hash_api_key(api_key))
@@ -342,7 +351,7 @@ impl ControlPlaneTenantStore {
 }
 
 impl TenantStore for ControlPlaneTenantStore {
-    fn authenticate(&self, api_key: &str) -> Option<Tenant> {
+    fn authenticate(&self, api_key: &str) -> Option<Arc<Tenant>> {
         let state = self.read();
         // Fail closed rather than serve revocations that are hours out of date.
         // `max_stale` is far longer than the refresh interval, so an ordinary

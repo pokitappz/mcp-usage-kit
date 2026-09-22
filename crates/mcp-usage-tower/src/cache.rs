@@ -1,10 +1,12 @@
 //! Authorization-aware cache for the six cacheable MCP result methods.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use http::{HeaderMap, StatusCode, Version};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -32,7 +34,11 @@ pub(crate) struct CachedResponse {
 
 #[derive(Debug, Clone)]
 struct Entry {
-    response: CachedResponse,
+    /// Shared rather than owned so a lookup clones a pointer under the lock
+    /// instead of a whole response. A cached `tools/list` is the largest body
+    /// the edge holds, and every hit used to deep-copy it before any other
+    /// reader could take the mutex.
+    response: Arc<CachedResponse>,
     expires_at: Instant,
     inserted_at: Instant,
 }
@@ -66,14 +72,16 @@ impl ResponseCache {
     /// on every cacheable request, and sweeping made it cost time proportional
     /// to the whole cache while holding the lock, so raising `max_entries`
     /// slowed down every reader. Whichever of the two keys is examined and
-    /// found expired is dropped here, and [`ResponseCache::insert`] still sweeps
-    /// globally, so expired responses do not accumulate.
+    /// found expired is dropped here, and [`ResponseCache::insert`] sweeps
+    /// globally when the cache fills, so expired responses do not accumulate.
+    ///
+    /// The caller's JSON-RPC id is applied by [`render_with_id`] afterwards,
+    /// outside the lock, so nothing but two hash lookups happens inside it.
     pub fn get(
         &self,
         logical: [u8; 32],
         authorization_context: &str,
-        request_id: Option<&Value>,
-    ) -> Option<CachedResponse> {
+    ) -> Option<Arc<CachedResponse>> {
         let now = Instant::now();
         let mut state = self
             .state
@@ -94,7 +102,7 @@ impl ResponseCache {
         for key in [private, public] {
             match state.entries.get(&key) {
                 Some(entry) if entry.expires_at > now => {
-                    response = Some(entry.response.clone());
+                    response = Some(Arc::clone(&entry.response));
                     break;
                 }
                 Some(_) => {
@@ -103,13 +111,7 @@ impl ResponseCache {
                 None => {}
             }
         }
-        let mut response = response?;
-        if let Some(id) = request_id
-            && let Some(object) = response.body.as_object_mut()
-        {
-            object.insert("id".to_owned(), id.clone());
-        }
-        Some(response)
+        response
     }
 
     pub fn insert(
@@ -143,7 +145,13 @@ impl ResponseCache {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entries.retain(|_, entry| entry.expires_at > now);
+        // Sweeping on every insert cost time proportional to the whole cache,
+        // under the lock, to reclaim nothing on a cache that is not full.
+        // Expiry only has to hold before eviction decides what to drop, and a
+        // lookup already reaps the keys it reads.
+        if state.entries.len() >= self.max_entries {
+            state.entries.retain(|_, entry| entry.expires_at > now);
+        }
         // Invalidation follows where the entry actually landed rather than what
         // the origin declared. A demoted public result must evict the shared
         // representation it was meant to supersede, not keep it alive.
@@ -172,7 +180,7 @@ impl ResponseCache {
         state.entries.insert(
             key,
             Entry {
-                response,
+                response: Arc::new(response),
                 expires_at,
                 inserted_at: now,
             },
@@ -189,7 +197,7 @@ impl ResponseCache {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RequestMetadata {
     pub request_id: Option<Value>,
     pub cache_key: Option<[u8; 32]>,
@@ -197,7 +205,76 @@ pub(crate) struct RequestMetadata {
     pub requested_task_id: Option<String>,
 }
 
+/// The four facts a non-cacheable request has to give up, and nothing else.
+///
+/// Deserializing into this instead of a [`Value`] is the difference between
+/// allocating a node per key in the body and allocating almost nothing.
+/// `tools/call` is the method with the largest bodies and the highest request
+/// rate, and it is never cacheable, so on the busiest path the whole tree was
+/// built and dropped unread.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LeanRequest {
+    /// `default` plus an explicit reader keeps the distinction a plain
+    /// `Option<Value>` would erase: an absent `id` is `None`, an `id` of
+    /// `null` is `Some(Value::Null)`. Only the first is a notification.
+    #[serde(deserialize_with = "present_value")]
+    id: Option<Value>,
+    params: LeanParams,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LeanParams {
+    #[serde(rename = "taskId")]
+    task_id: Option<String>,
+    /// `Option<IgnoredAny>` is exactly the `is_some_and(|v| !v.is_null())` test
+    /// the `Value` path runs: absent and `null` both read as `None`, any other
+    /// value reads as `Some` without being materialized.
+    #[serde(rename = "inputResponses")]
+    input_responses: Option<IgnoredAny>,
+    #[serde(rename = "requestState")]
+    request_state: Option<IgnoredAny>,
+}
+
+impl LeanParams {
+    const fn is_continuation(&self) -> bool {
+        self.input_responses.is_some() || self.request_state.is_some()
+    }
+}
+
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 pub(crate) fn inspect_request(call: &Call, bytes: &[u8]) -> RequestMetadata {
+    // Only a cacheable method needs the whole body: the cache key hashes the
+    // rendered `params` and the agreement check reads the name out of them.
+    // Everything else needs four fields.
+    if !call.method.is_cacheable()
+        && let Ok(lean) = serde_json::from_slice::<LeanRequest>(bytes)
+    {
+        return RequestMetadata {
+            request_id: lean.id,
+            cache_key: None,
+            is_continuation: lean.params.is_continuation(),
+            requested_task_id: if matches!(call.method, Method::TasksGet) {
+                lean.params.task_id
+            } else {
+                None
+            },
+        };
+    }
+    // A body whose `params` is an array or `null`, or which is not an object at
+    // all, fails the narrow parse. Falling through costs a second pass on an
+    // unusual shape rather than dropping the request id.
+    inspect_whole_body(call, bytes)
+}
+
+pub(crate) fn inspect_whole_body(call: &Call, bytes: &[u8]) -> RequestMetadata {
     let parsed: Option<Value> = serde_json::from_slice(bytes).ok();
     let request_id = parsed.as_ref().and_then(|body| body.get("id")).cloned();
     let requested_task_id = if matches!(call.method, Method::TasksGet) {
@@ -261,6 +338,54 @@ fn logical_key(method: &Method, body: &Value) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Serialize a cached body with the caller's JSON-RPC id in place of the
+/// stored one.
+///
+/// The stored [`Value`] is shared between every hit, so it cannot be mutated.
+/// Cloning it to overwrite one field meant deep-copying the whole tree, which
+/// for the cache's largest entries - a `tools/list` result carrying a schema
+/// per tool - is most of the work a cache hit was supposed to avoid.
+/// Substituting during serialization walks the tree once, which the caller has
+/// to do anyway to produce bytes.
+pub(crate) fn render_with_id(body: &Value, request_id: Option<&Value>) -> String {
+    match (request_id, body.as_object()) {
+        (Some(id), Some(object)) => {
+            serde_json::to_string(&BodyWithId { object, id }).unwrap_or_else(|_| body.to_string())
+        }
+        _ => body.to_string(),
+    }
+}
+
+struct BodyWithId<'a> {
+    object: &'a serde_json::Map<String, Value>,
+    id: &'a Value,
+}
+
+impl serde::Serialize for BodyWithId<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        // A response that carries no `id` still gets one, which is what
+        // inserting into the map did.
+        let appended = usize::from(!self.object.contains_key("id"));
+        let mut map = serializer.serialize_map(Some(self.object.len() + appended))?;
+        for (key, value) in self.object {
+            if key == "id" {
+                map.serialize_entry(key, self.id)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if appended == 1 {
+            map.serialize_entry("id", self.id)?;
+        }
+        map.end()
+    }
+}
+
 pub(crate) fn cache_hints(body: &Value) -> Option<(Duration, CacheScope)> {
     let result = body.get("result")?;
     if result.get("resultType").and_then(Value::as_str) != Some("complete") {
@@ -318,15 +443,113 @@ mod tests {
             stored(json!({"r": "a"})),
         );
         assert_eq!(cache.len(), 1);
-        assert!(cache.get([7; 32], "tenant-a", None).is_some());
+        assert!(cache.get([7; 32], "tenant-a").is_some());
 
         std::thread::sleep(Duration::from_millis(50));
 
         assert!(
-            cache.get([7; 32], "tenant-a", None).is_none(),
+            cache.get([7; 32], "tenant-a").is_none(),
             "an expired response must not be served"
         );
         assert_eq!(cache.len(), 0, "the expired entry must be dropped on read");
+    }
+
+    #[test]
+    fn a_full_cache_reclaims_expired_entries_before_evicting_live_ones() {
+        // Inserts no longer sweep every time, so the sweep has to happen at the
+        // one moment it decides anything: when the cache is full and something
+        // is about to be evicted. Without it a dead entry holds a slot and the
+        // oldest live entry is dropped to make room for the newcomer.
+        //
+        // The live entry is inserted first on purpose. If the expired one were
+        // also the oldest, plain eviction would remove it anyway and this would
+        // prove nothing about the sweep.
+        let cache = ResponseCache::new(2, Duration::from_secs(60), false);
+        cache.insert(
+            [1; 32],
+            "tenant-a",
+            CacheScope::Private,
+            Duration::from_secs(30),
+            stored(json!({"r": "oldest-but-live"})),
+        );
+        cache.insert(
+            [2; 32],
+            "tenant-a",
+            CacheScope::Private,
+            Duration::from_millis(20),
+            stored(json!({"r": "expiring"})),
+        );
+        assert_eq!(cache.len(), 2);
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        cache.insert(
+            [3; 32],
+            "tenant-a",
+            CacheScope::Private,
+            Duration::from_secs(30),
+            stored(json!({"r": "new"})),
+        );
+
+        assert_eq!(cache.len(), 2, "the cache must stay within max_entries");
+        assert_eq!(
+            cache.get([1; 32], "tenant-a").unwrap().body["r"],
+            "oldest-but-live",
+            "a live entry must not be evicted while a dead one holds a slot"
+        );
+        assert!(cache.get([2; 32], "tenant-a").is_none());
+        assert_eq!(cache.get([3; 32], "tenant-a").unwrap().body["r"], "new");
+    }
+
+    #[test]
+    fn a_full_cache_of_live_entries_evicts_the_oldest() {
+        let cache = ResponseCache::new(2, Duration::from_secs(60), false);
+        for (slot, label) in [([1; 32], "first"), ([2; 32], "second")] {
+            cache.insert(
+                slot,
+                "tenant-a",
+                CacheScope::Private,
+                Duration::from_secs(30),
+                stored(json!({ "r": label })),
+            );
+        }
+        cache.insert(
+            [3; 32],
+            "tenant-a",
+            CacheScope::Private,
+            Duration::from_secs(30),
+            stored(json!({"r": "third"})),
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get([1; 32], "tenant-a").is_none());
+        assert_eq!(cache.get([2; 32], "tenant-a").unwrap().body["r"], "second");
+        assert_eq!(cache.get([3; 32], "tenant-a").unwrap().body["r"], "third");
+    }
+
+    #[test]
+    fn rendering_substitutes_the_callers_id_without_touching_the_shared_body() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}});
+
+        let rendered = render_with_id(&body, Some(&json!("caller-7")));
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["id"], json!("caller-7"));
+        assert_eq!(parsed["result"]["resultType"], "complete");
+        assert_eq!(body["id"], json!(1), "the cached body must be untouched");
+
+        // A stored body with no id still gets the caller's.
+        let idless = json!({"jsonrpc": "2.0", "result": {}});
+        let rendered = render_with_id(&idless, Some(&json!(9)));
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap()["id"],
+            json!(9)
+        );
+
+        // No caller id means the stored body is rendered as it stands.
+        assert_eq!(
+            serde_json::from_str::<Value>(&render_with_id(&body, None)).unwrap(),
+            body
+        );
     }
 
     #[test]
@@ -343,10 +566,10 @@ mod tests {
             stored(json!({"r": "b"})),
         );
 
-        assert!(cache.get([1; 32], "tenant-c", None).is_none());
+        assert!(cache.get([1; 32], "tenant-c").is_none());
         assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get([7; 32], "tenant-a", None).unwrap().body["r"], "a");
-        assert_eq!(cache.get([9; 32], "tenant-b", None).unwrap().body["r"], "b");
+        assert_eq!(cache.get([7; 32], "tenant-a").unwrap().body["r"], "a");
+        assert_eq!(cache.get([9; 32], "tenant-b").unwrap().body["r"], "b");
     }
 
     #[test]
@@ -354,9 +577,9 @@ mod tests {
         let cache = ResponseCache::new(16, Duration::from_secs(60), false);
         put(&cache, "tenant-a", CacheScope::Public, json!({"r": "a"}));
 
-        assert!(cache.get([7; 32], "tenant-a", None).is_some());
+        assert!(cache.get([7; 32], "tenant-a").is_some());
         assert!(
-            cache.get([7; 32], "tenant-b", None).is_none(),
+            cache.get([7; 32], "tenant-b").is_none(),
             "an origin declaring `public` must not leak across tenants unless the operator opted in"
         );
     }
@@ -366,7 +589,7 @@ mod tests {
         let cache = ResponseCache::new(16, Duration::from_secs(60), true);
         put(&cache, "tenant-a", CacheScope::Public, json!({"r": "a"}));
 
-        assert_eq!(cache.get([7; 32], "tenant-b", None).unwrap().body["r"], "a");
+        assert_eq!(cache.get([7; 32], "tenant-b").unwrap().body["r"], "a");
     }
 
     #[test]
@@ -374,8 +597,8 @@ mod tests {
         for share_public in [false, true] {
             let cache = ResponseCache::new(16, Duration::from_secs(60), share_public);
             put(&cache, "tenant-a", CacheScope::Private, json!({"r": "a"}));
-            assert!(cache.get([7; 32], "tenant-a", None).is_some());
-            assert!(cache.get([7; 32], "tenant-b", None).is_none());
+            assert!(cache.get([7; 32], "tenant-a").is_some());
+            assert!(cache.get([7; 32], "tenant-b").is_none());
         }
     }
 
@@ -388,7 +611,7 @@ mod tests {
             CacheScope::Public,
             json!({"r": "public"}),
         );
-        assert!(cache.get([7; 32], "tenant-b", None).is_some());
+        assert!(cache.get([7; 32], "tenant-b").is_some());
 
         put(
             &cache,
@@ -397,13 +620,10 @@ mod tests {
             json!({"r": "private"}),
         );
         assert!(
-            cache.get([7; 32], "tenant-b", None).is_none(),
+            cache.get([7; 32], "tenant-b").is_none(),
             "the superseded shared entry must not outlive its private replacement"
         );
-        assert_eq!(
-            cache.get([7; 32], "tenant-a", None).unwrap().body["r"],
-            "private"
-        );
+        assert_eq!(cache.get([7; 32], "tenant-a").unwrap().body["r"], "private");
     }
 
     #[test]
@@ -414,8 +634,8 @@ mod tests {
         put(&cache, "tenant-a", CacheScope::Private, json!({"r": "a"}));
         put(&cache, "tenant-b", CacheScope::Public, json!({"r": "b"}));
 
-        assert_eq!(cache.get([7; 32], "tenant-a", None).unwrap().body["r"], "a");
-        assert_eq!(cache.get([7; 32], "tenant-b", None).unwrap().body["r"], "b");
+        assert_eq!(cache.get([7; 32], "tenant-a").unwrap().body["r"], "a");
+        assert_eq!(cache.get([7; 32], "tenant-b").unwrap().body["r"], "b");
     }
 
     #[test]
