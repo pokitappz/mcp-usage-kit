@@ -109,8 +109,23 @@ pub trait UsageRecorder: Send + Sync {
     fn record(&self, event: UsageEvent) -> Result<RecordOutcome, RecordError>;
 }
 
+/// Ordering required when retrying a failed export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetryPolicy {
+    /// Alternate retries with fresh usage, retaining each original batch.
+    #[default]
+    Interleave,
+    /// Complete the current batch before submitting any other batch.
+    CompleteBatch,
+}
+
 /// Exports a prepared batch away from the request path.
 pub trait BatchExporter: Send + Sync {
+    /// Ordering required after a failed or cancelled export.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::Interleave
+    }
+
     /// Export every aggregate in `batch`.
     ///
     /// Retrying the same batch must be safe because identifiers are stable.
@@ -197,6 +212,18 @@ impl fmt::Debug for CompositeExporter {
 }
 
 impl BatchExporter for CompositeExporter {
+    fn retry_policy(&self) -> RetryPolicy {
+        if self
+            .exporters
+            .iter()
+            .any(|e| e.retry_policy() == RetryPolicy::CompleteBatch)
+        {
+            RetryPolicy::CompleteBatch
+        } else {
+            RetryPolicy::Interleave
+        }
+    }
+
     fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
         Box::pin(async move {
             for exporter in &self.exporters {
@@ -244,10 +271,10 @@ struct PendingAggregate {
 #[derive(Debug, Default)]
 struct BufferState {
     pending: HashMap<AggregateKey, PendingAggregate>,
-    retry: Vec<AggregatedUsage>,
+    retry: VecDeque<Vec<AggregatedUsage>>,
     seen: HashSet<(String, String)>,
     seen_order: VecDeque<(String, String)>,
-    /// Set when a retry batch comes back unexported, so the next flush serves
+    /// Set when a retry batch is selected, so the next flush serves
     /// fresh usage instead. Without it a batch the provider will never accept
     /// is re-offered on every flush forever and no other customer's usage is
     /// ever exported again.
@@ -270,7 +297,7 @@ impl fmt::Debug for UsageBuffer {
             .debug_struct("UsageBuffer")
             .field(
                 "pending_buckets",
-                &(state.pending.len() + state.retry.len()),
+                &(state.pending.len() + state.retry.iter().map(Vec::len).sum::<usize>()),
             )
             .field("retained_idempotency_keys", &state.seen.len())
             .field("max_idempotency_keys", &self.max_idempotency_keys)
@@ -354,7 +381,7 @@ impl UsageBuffer {
         Ok(RecordOutcome::Recorded)
     }
 
-    fn prepare_flush(&self) -> Result<Vec<AggregatedUsage>, RecordError> {
+    fn prepare_flush(&self, policy: RetryPolicy) -> Result<Vec<AggregatedUsage>, RecordError> {
         let mut state = self.lock()?;
 
         // A retry goes first, because its identifiers are already known to the
@@ -362,13 +389,15 @@ impl UsageBuffer {
         // *every* time: a batch the provider will never accept would otherwise
         // be re-offered on every flush forever, and every other customer's
         // usage would sit behind it until the process died and took the whole
-        // buffer with it. After a failure the next flush serves fresh usage,
-        // so a stuck batch delays itself rather than everyone.
-        let take_retry =
-            !state.retry.is_empty() && (!state.serve_pending_next || state.pending.is_empty());
+        // buffer with it. Alternate retry attempts with fresh usage unless the
+        // exporter requires completion of its current immutable batch.
+        let take_retry = !state.retry.is_empty()
+            && (policy == RetryPolicy::CompleteBatch
+                || !state.serve_pending_next
+                || state.pending.is_empty());
         if take_retry {
-            state.serve_pending_next = false;
-            return Ok(std::mem::take(&mut state.retry));
+            state.serve_pending_next = true;
+            return Ok(state.retry.pop_front().unwrap_or_default());
         }
         state.serve_pending_next = false;
         let mut batch: Vec<_> = std::mem::take(&mut state.pending)
@@ -394,12 +423,7 @@ impl UsageBuffer {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.retry.is_empty() {
-            state.retry = batch;
-        } else {
-            state.retry.extend(batch);
-        }
-        state.serve_pending_next = true;
+        state.retry.push_back(batch);
     }
 
     /// Number of aggregates waiting to be retried.
@@ -412,7 +436,7 @@ impl UsageBuffer {
     pub fn retry_buckets(&self) -> usize {
         self.state
             .lock()
-            .map(|state| state.retry.len())
+            .map(|state| state.retry.iter().map(Vec::len).sum::<usize>())
             .unwrap_or_default()
     }
 
@@ -421,7 +445,7 @@ impl UsageBuffer {
     pub fn pending_buckets(&self) -> usize {
         self.state
             .lock()
-            .map(|state| state.pending.len() + state.retry.len())
+            .map(|state| state.pending.len() + state.retry.iter().map(Vec::len).sum::<usize>())
             .unwrap_or_default()
     }
 }
@@ -508,7 +532,7 @@ impl<E: BatchExporter> BillingPipeline<E> {
         let _guard = FlushGuard(&self.flush_in_progress);
         let batch = self
             .buffer
-            .prepare_flush()
+            .prepare_flush(self.exporter.retry_policy())
             .map_err(|error| ExportError::Provider(error.to_string()))?;
         if batch.is_empty() {
             return Ok(0);

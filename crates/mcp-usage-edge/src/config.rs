@@ -237,6 +237,9 @@ pub struct MppSettings {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FacilitatorSettings {
+    /// Maximum facilitator verdict response size.
+    #[serde(default = "default_facilitator_response_bytes")]
+    pub max_response_bytes: usize,
     /// Absolute URL of the verification endpoint.
     pub url: String,
     /// Environment variable holding a bearer token for it, when it needs one.
@@ -342,6 +345,9 @@ impl Upstream {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeSettings {
+    /// Maximum time for active connections, deferred accounting and final exports.
+    #[serde(default = "default_shutdown_timeout_seconds")]
+    pub shutdown_timeout_seconds: u64,
     /// Refuse protocol revisions older than the one the meter understands.
     ///
     /// Defaults to `false`, matching the library. A sidecar whose whole promise
@@ -377,6 +383,10 @@ pub struct EdgeSettings {
     pub auth_failure_limit: Option<AuthFailureLimitSettings>,
 }
 
+const fn default_shutdown_timeout_seconds() -> u64 {
+    10
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -385,6 +395,7 @@ impl Default for EdgeSettings {
     fn default() -> Self {
         Self {
             strict_protocol_version: false,
+            shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
             credential_forwarding: true,
             max_request_body_bytes: None,
             max_response_capture_bytes: None,
@@ -486,6 +497,9 @@ pub enum ExporterKind {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPlaneSettings {
+    /// Maximum snapshot or usage acknowledgement response size.
+    #[serde(default = "default_plane_response_bytes")]
+    pub max_response_bytes: usize,
     /// Base URL, for example `https://plane.example.com`.
     pub url: String,
     /// Environment variable holding this edge's token.
@@ -734,6 +748,13 @@ impl Config {
         }
         Ok(resolved)
     }
+}
+
+const fn default_plane_response_bytes() -> usize {
+    16 * 1024 * 1024
+}
+const fn default_facilitator_response_bytes() -> usize {
+    64 * 1024
 }
 
 #[cfg(test)]

@@ -421,7 +421,7 @@ where
                     }
                 };
             let legacy = classification.is_from_body();
-            let protocol = match classification.resolve(&request_bytes) {
+            let protocol = match classification.resolve(&parts.method, &request_bytes) {
                 Ok(protocol) => protocol,
                 Err(message) => {
                     config.metrics.rejected();
@@ -431,6 +431,19 @@ where
                         &message,
                     ));
                 }
+            };
+            let Some(protocol) = protocol else {
+                if !config.forward_credentials {
+                    parts.headers.remove(crate::API_KEY_HEADER);
+                    parts.headers.remove(AUTHORIZATION);
+                }
+                let response = inner
+                    .call(Request::from_parts(parts, Full::new(request_bytes)))
+                    .await?;
+                return Ok(response.map(|body| {
+                    body.map_err(|error| -> BoxError { Box::new(error) })
+                        .boxed_unsync()
+                }));
             };
             let metadata = inspect_request(&protocol.call, &request_bytes);
             if let Some(key) = metadata.cache_key
@@ -500,12 +513,16 @@ where
     }
 }
 
-struct ClassifiedCall {
-    call: Call,
+/// Validated identity shared by pricing and metering.
+#[derive(Debug, Clone)]
+pub struct ClassifiedCall {
+    /// The call the origin will execute.
+    pub call: Call,
 }
 
 /// The outcome of looking at the request headers alone.
-enum Classification {
+#[derive(Debug, Clone)]
+pub enum Classification {
     /// The revision mandates header/body validation, so the headers priced the call
     /// and the body is never parsed.
     FromHeaders(ClassifiedCall),
@@ -515,27 +532,65 @@ enum Classification {
 
 impl Classification {
     /// Whether the call was priced from the body rather than from trusted headers.
-    const fn is_from_body(&self) -> bool {
+    #[must_use]
+    pub const fn is_from_body(&self) -> bool {
         matches!(self, Self::FromBody)
     }
 
     /// Finish classification, reading the body only when the headers could not be
     /// trusted. Called after the credential gate.
-    fn resolve(self, body: &[u8]) -> Result<ClassifiedCall, String> {
+    /// Transport operations and valid client responses return `None`.
+    ///
+    /// # Errors
+    /// Returns an error when the legacy body cannot be classified safely.
+    pub fn resolve(
+        self,
+        http_method: &http::Method,
+        body: &[u8],
+    ) -> Result<Option<ClassifiedCall>, String> {
         match self {
-            Self::FromHeaders(classified) => Ok(classified),
+            Self::FromHeaders(classified) => Ok(Some(classified)),
             Self::FromBody => {
+                if matches!(*http_method, http::Method::GET | http::Method::DELETE) {
+                    return if body.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err("transport requests must have an empty body".into())
+                    };
+                }
+                // A response to a server request is transport traffic, never a new call.
+                // Require a response envelope; arbitrary methodless objects still fail.
+                if let Ok(value) = serde_json::from_slice::<Value>(body)
+                    && value.get("method").is_none()
+                    && value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                    && value
+                        .get("id")
+                        .is_some_and(|id| id.is_string() || id.is_number())
+                    && (value.get("result").is_some() ^ value.get("error").is_some())
+                {
+                    return Ok(None);
+                }
                 let (method, name) =
                     mcp_usage_core::classify_body(body).map_err(|error| error.to_string())?;
-                Ok(ClassifiedCall {
+                if method.as_str().starts_with("notifications/") {
+                    return Ok(None);
+                }
+                Ok(Some(ClassifiedCall {
                     call: Call::new(method, name),
-                })
+                }))
             }
         }
     }
 }
 
-fn classify_request_headers(headers: &HeaderMap, strict: bool) -> Result<Classification, String> {
+/// Validate unique protocol headers before authenticating or reading a body.
+///
+/// # Errors
+/// Returns an error for duplicate, malformed, or disallowed protocol headers.
+pub fn classify_request_headers(
+    headers: &HeaderMap,
+    strict: bool,
+) -> Result<Classification, String> {
     let version = optional_header_str(headers, PROTOCOL_VERSION_HEADER)?;
     let method = optional_header_str(headers, METHOD_HEADER)?;
     let name = optional_header_str(headers, NAME_HEADER)?;
@@ -596,13 +651,20 @@ fn unique_header<'a>(
     Ok(value)
 }
 
+/// Missing or ambiguous tenant credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialError {
+pub enum CredentialError {
+    /// No credential was presented.
     Missing,
+    /// A credential was malformed or ambiguous.
     Invalid,
 }
 
-fn extract_api_key(headers: &HeaderMap) -> Result<&str, CredentialError> {
+/// Extract exactly one API key or Bearer credential.
+///
+/// # Errors
+/// Rejects missing, duplicate, or ambiguous credentials.
+pub fn extract_api_key(headers: &HeaderMap) -> Result<&str, CredentialError> {
     let direct =
         unique_header(headers, crate::API_KEY_HEADER).map_err(|_| CredentialError::Invalid)?;
     let authorization =
@@ -1765,6 +1827,7 @@ mod tests {
             "resources/subscribe",
         ] {
             let legacy = Request::builder()
+                .method("POST")
                 .header(crate::API_KEY_HEADER, "secret")
                 .body(Full::new(Bytes::from(
                     json!({"jsonrpc":"2.0","id":1,"method":method}).to_string(),
@@ -1800,6 +1863,7 @@ mod tests {
             }));
 
         let legacy = Request::builder()
+            .method("POST")
             .header(crate::API_KEY_HEADER, "secret")
             .body(Full::new(Bytes::from(
                 json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -2003,6 +2067,7 @@ mod tests {
 
         // No MCP-Protocol-Version, no Mcp-Method, no Mcp-Name: only a JSON-RPC body.
         let legacy = Request::builder()
+            .method("POST")
             .header(crate::API_KEY_HEADER, "secret")
             .body(Full::new(Bytes::from(
                 json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -2044,6 +2109,7 @@ mod tests {
             }));
 
         let legacy = Request::builder()
+            .method("POST")
             .header(crate::API_KEY_HEADER, "secret")
             .body(Full::new(Bytes::from(
                 json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -2133,6 +2199,7 @@ mod tests {
         // On a trusted revision the origin would reject the disagreement. Here the
         // headers are ignored entirely, so the body decides both price and execution.
         let lying = Request::builder()
+            .method("POST")
             .header(crate::API_KEY_HEADER, "secret")
             .header(METHOD_HEADER, "tools/list")
             .header(NAME_HEADER, "cheap")
@@ -2174,6 +2241,7 @@ mod tests {
             }));
 
         let legacy = Request::builder()
+            .method("POST")
             .header(crate::API_KEY_HEADER, "secret")
             .body(Full::new(Bytes::from(
                 json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),

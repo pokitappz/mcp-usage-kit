@@ -115,12 +115,25 @@ async fn spawn_upstream(script: Script) -> SocketAddr {
                     hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
                         let script = script.clone();
                         async move {
+                            let sse = request.method() == http::Method::GET;
                             let body = script.next_body(request.headers().clone());
+                            let body = if sse {
+                                format!("id: event-10\ndata: {body}\n\n")
+                            } else {
+                                body
+                            };
                             let mut response = Response::new(Full::new(Bytes::from(body)));
                             response.headers_mut().insert(
                                 http::header::CONTENT_TYPE,
-                                http::HeaderValue::from_static("application/json"),
+                                http::HeaderValue::from_static(if sse {
+                                    "text/event-stream"
+                                } else {
+                                    "application/json"
+                                }),
                             );
+                            response
+                                .headers_mut()
+                                .insert("mcp-session-id", "session-123".parse().unwrap());
                             Ok::<_, Infallible>(response)
                         }
                     });
@@ -515,5 +528,68 @@ async fn an_unreachable_upstream_returns_a_gateway_error_and_bills_nothing() {
         billing.exporter().total_units(),
         0,
         "an outage must never bill"
+    );
+}
+
+#[tokio::test]
+async fn legacy_session_reconnection_and_client_responses_are_forwarded_without_billing() {
+    let h = spawn_sidecar().await;
+    for (method, body) in [
+        (
+            "POST",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ),
+        (
+            "POST",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        ),
+        ("GET", ""),
+        (
+            "POST",
+            r#"{"jsonrpc":"2.0","id":"server-request","result":{"answer":"yes"}}"#,
+        ),
+        (
+            "POST",
+            r#"{"jsonrpc":"2.0","id":"server-request","error":{"code":-32601,"message":"unsupported"}}"#,
+        ),
+        ("DELETE", ""),
+    ] {
+        h.script
+            .queue(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"content":[]}}));
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("http://{}/mcp", h.addr))
+            .header("x-api-key", API_KEY)
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", "session-123")
+            .header("last-event-id", "event-9")
+            .header("accept", "text/event-stream")
+            .body(Full::new(Bytes::from_static(body.as_bytes())))
+            .unwrap();
+        let response = h.client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method} {body}");
+        assert_eq!(response.headers()["mcp-session-id"], "session-123");
+        if method == "GET" {
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+        }
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        if method == "GET" {
+            assert!(bytes.starts_with(b"id: event-10\ndata: "));
+        }
+    }
+    assert_eq!(h.script.headers_seen().len(), 6);
+    for headers in h.script.headers_seen() {
+        assert_eq!(headers["mcp-session-id"], "session-123");
+        assert_eq!(headers["last-event-id"], "event-9");
+    }
+    assert_eq!(h.billed_units().await, 0);
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/mcp", h.addr))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    assert_eq!(
+        h.client.request(request).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
     );
 }

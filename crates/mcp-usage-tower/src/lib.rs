@@ -28,7 +28,10 @@ pub use auth::{
 };
 pub use classify::{ClassificationError, ProtocolHeaders, classify_protocol_headers};
 pub use deferred::DeferredCompletions;
-pub use layer::{EdgeConfig, EdgeConfigError, MeterBody, MeterLayer, MeterService};
+pub use layer::{
+    Classification, ClassifiedCall, CredentialError, EdgeConfig, EdgeConfigError, MeterBody,
+    MeterLayer, MeterService, classify_request_headers, extract_api_key,
+};
 pub use mcp_usage_core::{TaskAttribution, TaskOriginKind};
 pub use metrics::{EdgeMetrics, MetricsSnapshot, UnaccountedReason};
 #[cfg(feature = "opentelemetry")]

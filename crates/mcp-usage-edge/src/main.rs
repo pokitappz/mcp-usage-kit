@@ -48,7 +48,7 @@ fn main() -> ExitCode {
             // Startup failures print as well as log, because an operator
             // watching a container start should not need a log level set.
             eprintln!("mcp-usage-edge: {error}");
-            tracing::error!(%error, "startup failed");
+            tracing::error!(%error, "sidecar failed");
             ExitCode::FAILURE
         }
     }
@@ -96,7 +96,8 @@ fn tenant_source(
             &settings.url,
             settings.token()?,
             settings.timeout(),
-        );
+        )
+        .with_max_response_bytes(settings.max_response_bytes);
         let store = Arc::new(ControlPlaneTenantStore::new(settings.max_stale()));
         return Ok((store.clone(), Some(client), Some(store)));
     }
@@ -215,7 +216,8 @@ fn admission_gate(
             settings.facilitator.url.clone(),
             settings.facilitator.token()?,
             settings.facilitator.timeout(),
-        );
+        )
+        .with_max_response_bytes(settings.facilitator.max_response_bytes);
         let payments = Payments::new(
             PaymentsConfig {
                 secret: settings.secret()?,
@@ -240,7 +242,7 @@ fn admission_gate(
     if let Some(bytes) = config.edge.max_request_body_bytes {
         gate = gate.with_max_body(bytes);
     }
-    Ok(gate)
+    Ok(gate.with_strict_protocol_version(config.edge.strict_protocol_version))
 }
 
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -250,17 +252,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let http = build_client();
     let (tenants, plane, cached) = tenant_source(&config, &http)?;
 
-    let exporter = match config.exporter.kind {
-        ExporterKind::Log => EdgeExporter::Log(LogExporter::new()),
-        ExporterKind::ControlPlane => {
-            let client = plane
-                .clone()
-                .ok_or("exporter.kind = \"control-plane\" requires a [control_plane] section")?;
-            EdgeExporter::Plane(Box::new(MeterEventExporter::new(
-                ControlPlaneExporter::new(client),
-            )))
-        }
-    };
+    let exporter = EdgeExporter::configured(config.exporter.kind, plane.clone())?;
     let billing = Arc::new(BillingPipeline::new(exporter));
 
     let edge = edge_config(
@@ -270,30 +262,12 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         task_store(&config).await?,
     )?;
 
-    // Pull one snapshot before the listener opens, so the sidecar does not
-    // refuse every call for the first refresh interval.
-    if let (Some(store), Some(client)) = (cached.as_ref(), plane.as_ref()) {
-        match client.snapshot().await {
-            Ok(snapshot) => {
-                tracing::info!(keys = snapshot.tenants.len(), "loaded initial snapshot");
-                store.apply(snapshot);
-            }
-            // Starting anyway is deliberate: the refresh loop retries, and a
-            // sidecar that refuses to boot because the plane is briefly down is
-            // an outage the plane should not be able to cause.
-            Err(error) => {
-                tracing::error!(%error, "initial snapshot failed; starting cold and retrying");
-            }
-        }
-        let settings = config
-            .control_plane
-            .as_ref()
-            .expect("plane implies settings");
-        tokio::spawn(refresh_forever(
-            store.clone(),
-            client.clone(),
-            settings.refresh_interval(),
-        ));
+    if let (Some(store), Some(client), Some(settings)) = (
+        cached.as_ref(),
+        plane.as_ref(),
+        config.control_plane.as_ref(),
+    ) {
+        start_refresh(store.clone(), client.clone(), settings.refresh_interval()).await;
     }
 
     let gate = admission_gate(&config, cached.as_ref(), &http)?;
@@ -303,6 +277,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         &config.upstream.url,
         config.upstream.timeout(),
     )?;
+    let deferred = edge.deferred();
     let service = gate.layer(MeterLayer::new(edge).layer(proxy));
 
     let listener = TcpListener::bind(config.listen).await?;
@@ -315,11 +290,19 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let flusher = tokio::spawn(flush_loop(
         billing.clone(),
+        deferred.clone(),
         config.exporter.flush_interval(),
     ));
 
+    let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
     loop {
         tokio::select! {
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result { tracing::warn!(%error, "connection task failed"); }
+            }
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
                     Ok(accepted) => accepted,
@@ -329,45 +312,112 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 let connection_service = TowerToHyperService::new(service.clone());
-                tokio::spawn(async move {
+                let mut stopping = stopping.clone();
+                connections.spawn(async move {
                     let io = TokioIo::new(stream);
-                    if let Err(error) = http1::Builder::new()
-                        .serve_connection(io, connection_service)
-                        .await
-                    {
+                    let connection = http1::Builder::new().serve_connection(io, connection_service);
+                    tokio::pin!(connection);
+                    let result = tokio::select! {
+                        result = &mut connection => result,
+                        _ = stopping.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.await
+                        }
+                    };
+                    if let Err(error) = result {
                         tracing::debug!(%peer, %error, "connection closed");
                     }
                 });
             }
-            () = shutdown_signal() => {
+            () = &mut signal => {
                 tracing::info!("shutdown requested");
                 break;
             }
         }
     }
 
-    // Usage already recorded but not yet exported would otherwise be lost, so
-    // the final flush runs before the process exits rather than after the
-    // flush task is dropped.
-    // `abort()` only schedules cancellation: the task is dropped at its next
-    // scheduling point. Without awaiting it, a SIGTERM arriving while the
-    // flush loop is suspended inside an export leaves `flush_in_progress`
-    // set, so the final flush below returns `FlushInProgress` and the process
-    // exits with the whole buffer still in memory.
-    flusher.abort();
-    let _ = flusher.await;
-    match billing.flush().await {
-        Ok(count) => tracing::info!(exported = count, "final flush complete"),
-        Err(error) => tracing::error!(%error, "final flush failed; usage may be unexported"),
+    drop(listener);
+    let _ = shutdown.send(true);
+    finish_shutdown(
+        connections,
+        flusher,
+        &billing,
+        &deferred,
+        std::time::Duration::from_secs(config.edge.shutdown_timeout_seconds),
+    )
+    .await
+}
+
+/// Load initial authentication data, then retry snapshots in the background.
+async fn start_refresh(
+    store: Arc<ControlPlaneTenantStore>,
+    client: PlaneClient,
+    interval: std::time::Duration,
+) {
+    match client.snapshot().await {
+        Ok(snapshot) => {
+            tracing::info!(keys = snapshot.tenants.len(), "loaded initial snapshot");
+            store.apply(snapshot);
+        }
+        // A transient plane outage should not prevent the listener from starting.
+        Err(error) => {
+            tracing::error!(%error, "initial snapshot failed; starting cold and retrying");
+        }
     }
+    tokio::spawn(refresh_forever(store, client, interval));
+}
+
+async fn finish_shutdown(
+    mut connections: tokio::task::JoinSet<()>,
+    flusher: tokio::task::JoinHandle<()>,
+    billing: &BillingPipeline<EdgeExporter>,
+    deferred: &mcp_usage_kit::tower::DeferredCompletions,
+    budget: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .ok_or("shutdown timeout is too large")?;
+    flusher.abort();
+    let finished = tokio::time::timeout_at(deadline, async {
+        let _ = flusher.await;
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "connection task failed");
+            }
+        }
+        deferred.drain().await;
+        while billing.pending_buckets() > 0 {
+            if let Err(error) = billing.flush().await {
+                tracing::warn!(%error, "final flush failed; retrying within shutdown budget");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    })
+    .await;
+    report_unexported(billing);
+    if finished.is_err() {
+        tracing::error!(
+            pending = billing.pending_buckets(),
+            deferred = deferred.len(),
+            active = connections.len(),
+            "shutdown deadline exceeded; accounting may be incomplete"
+        );
+        return Err("shutdown deadline exceeded".into());
+    }
+    tracing::info!("final flush complete");
     Ok(())
 }
 
-async fn flush_loop(billing: Arc<BillingPipeline<EdgeExporter>>, interval: std::time::Duration) {
+async fn flush_loop(
+    billing: Arc<BillingPipeline<EdgeExporter>>,
+    deferred: Arc<mcp_usage_kit::tower::DeferredCompletions>,
+    interval: std::time::Duration,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        deferred.drain_some(deferred.len()).await;
         match billing.flush().await {
             Ok(0) | Err(ExportError::FlushInProgress) => {}
             Ok(count) => tracing::debug!(exported = count, "flushed usage"),
@@ -432,7 +482,30 @@ enum EdgeExporter {
     Plane(Box<MeterEventExporter<ControlPlaneExporter>>),
 }
 
+impl EdgeExporter {
+    fn configured(kind: ExporterKind, plane: Option<PlaneClient>) -> Result<Self, &'static str> {
+        match kind {
+            ExporterKind::Log => Ok(Self::Log(LogExporter::new())),
+            ExporterKind::ControlPlane => {
+                let client = plane.ok_or(
+                    "exporter.kind = \"control-plane\" requires a [control_plane] section",
+                )?;
+                Ok(Self::Plane(Box::new(MeterEventExporter::new(
+                    ControlPlaneExporter::new(client),
+                ))))
+            }
+        }
+    }
+}
+
 impl BatchExporter for EdgeExporter {
+    fn retry_policy(&self) -> mcp_usage_kit::export::RetryPolicy {
+        match self {
+            Self::Log(exporter) => exporter.retry_policy(),
+            Self::Plane(exporter) => exporter.retry_policy(),
+        }
+    }
+
     fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
         match self {
             Self::Log(exporter) => exporter.export(batch),

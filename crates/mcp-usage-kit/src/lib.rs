@@ -43,15 +43,16 @@ pub use mcp_usage_export::{
     AggregatedUsage, BatchExporter, BillingPipeline, CompositeExporter, ExportError, ExportFuture,
     FnExporter, LogExporter, MeterEventDeadLetter, MeterEventDeadLetterReason, MeterEventExporter,
     MeterEventOutcome, MeterEventProvider, MeterEventProviderError, MeterEventProviderFuture,
-    NoopRecorder, RecordError, RecordOutcome, SharedExporter, SharedRecorder, UsageBuffer,
-    UsageEvent, UsageRecorder,
+    NoopRecorder, RecordError, RecordOutcome, RetryPolicy, SharedExporter, SharedRecorder,
+    UsageBuffer, UsageEvent, UsageRecorder,
 };
 pub use mcp_usage_tower::{
-    API_KEY_HEADER, DeferredCompletions, EdgeConfig, EdgeConfigError, EdgeMetrics,
-    InMemoryTaskStore, InMemoryTenantStore, METHOD_HEADER, MIN_API_KEY_BYTES, MeterBody,
-    MeterLayer, MeterService, MetricsSnapshot, NAME_HEADER, PROTOCOL_VERSION_HEADER,
-    TaskAttributionStore, TaskStoreError, TaskStoreFuture, Tenant, TenantStore, WeakApiKey,
-    hash_api_key, validate_api_key_strength,
+    API_KEY_HEADER, Classification, ClassifiedCall, CredentialError, DeferredCompletions,
+    EdgeConfig, EdgeConfigError, EdgeMetrics, InMemoryTaskStore, InMemoryTenantStore,
+    METHOD_HEADER, MIN_API_KEY_BYTES, MeterBody, MeterLayer, MeterService, MetricsSnapshot,
+    NAME_HEADER, PROTOCOL_VERSION_HEADER, TaskAttributionStore, TaskStoreError, TaskStoreFuture,
+    Tenant, TenantStore, WeakApiKey, classify_request_headers, extract_api_key, hash_api_key,
+    validate_api_key_strength,
 };
 
 #[cfg(feature = "opentelemetry")]
