@@ -375,3 +375,38 @@ async fn panic_leaves_all_events_retryable() {
     exporter.export(&batch).await.unwrap();
     assert_eq!(exporter.provider().attempts.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn traffic_during_outage_preserves_batches_through_composite_exporter() {
+    let provider = FakeProvider::with_responses([
+        Err(MeterEventProviderError::new("unavailable")),
+        Err(MeterEventProviderError::new("unavailable")),
+    ]);
+    let exporter = Arc::new(MeterEventExporter::new(provider));
+    let composite = mcp_usage_export::CompositeExporter::new().with_exporter(exporter.clone());
+    let pipeline = BillingPipeline::new(composite);
+    pipeline
+        .record(UsageEvent::now("t", "a", "units", 7, None))
+        .unwrap();
+    assert!(pipeline.flush().await.is_err());
+    pipeline
+        .record(UsageEvent::now("t", "a", "units", 11, None))
+        .unwrap();
+    assert!(pipeline.flush().await.is_err());
+    pipeline
+        .record(UsageEvent::now("t", "b", "units", 13, None))
+        .unwrap();
+    assert_eq!(pipeline.flush().await.unwrap(), 1);
+    assert_eq!(pipeline.flush().await.unwrap(), 2);
+    assert_eq!(pipeline.pending_buckets(), 0);
+    let attempts = exporter.provider().attempts();
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[0], attempts[1]);
+    assert_eq!(attempts[1], attempts[2]);
+    assert_eq!(attempts[3].iter().map(|e| e.units).sum::<u64>(), 24);
+    assert!(
+        attempts[3]
+            .iter()
+            .all(|e| e.identifier != attempts[0][0].identifier)
+    );
+}

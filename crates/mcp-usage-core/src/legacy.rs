@@ -80,14 +80,15 @@ pub fn classify_body(body: &[u8]) -> Result<(Method, Option<String>), LegacyClas
     }
     // resources/read identifies its target by uri; the other two by name. Mcp-Name
     // mirrors whichever the method uses, so the fallback has to do the same.
+    let field = if method == Method::ResourcesRead {
+        "uri"
+    } else {
+        "name"
+    };
     let name = value
         .get("params")
-        .and_then(|params| {
-            params
-                .get("name")
-                .or_else(|| params.get("uri"))
-                .and_then(Value::as_str)
-        })
+        .and_then(|params| params.get(field))
+        .and_then(Value::as_str)
         .ok_or_else(|| LegacyClassificationError::MissingName(method.clone()))?;
     Ok((method, Some(name.to_owned())))
 }
@@ -95,6 +96,43 @@ pub fn classify_body(body: &[u8]) -> Result<(Method, Option<String>), LegacyClas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_methods_only_accept_their_own_target_field() {
+        for (method, required, other) in [
+            ("resources/read", "uri", "name"),
+            ("tools/call", "name", "uri"),
+            ("prompts/get", "name", "uri"),
+        ] {
+            let body =
+                serde_json::json!({"method":method,"params":{required:"expensive",other:"free"}});
+            assert_eq!(
+                classify_body(body.to_string().as_bytes())
+                    .unwrap()
+                    .1
+                    .as_deref(),
+                Some("expensive")
+            );
+            for invalid in [
+                Value::Null,
+                Value::Bool(false),
+                serde_json::json!(123),
+                serde_json::json!([]),
+            ] {
+                let body =
+                    serde_json::json!({"method":method,"params":{required:invalid,other:"free"}});
+                assert!(matches!(
+                    classify_body(body.to_string().as_bytes()),
+                    Err(LegacyClassificationError::MissingName(_))
+                ));
+            }
+            let body = serde_json::json!({"method":method,"params":{other:"free"}});
+            assert!(matches!(
+                classify_body(body.to_string().as_bytes()),
+                Err(LegacyClassificationError::MissingName(_))
+            ));
+        }
+    }
 
     #[test]
     fn tools_call_is_priced_on_the_name_in_the_body() {

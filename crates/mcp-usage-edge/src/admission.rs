@@ -1,7 +1,8 @@
 //! Deciding whether a call may proceed, and offering a way to pay when it may not.
 //!
 //! This sits *outside* the meter, so a refused call is rejected before it is
-//! classified, priced or forwarded, and nothing is recorded for it. A tenant
+//! forwarded, and nothing is recorded for it. Classification and authentication
+//! are shared with the meter and run before any payment verification. A tenant
 //! over its cap should cost its operator nothing, not a free upstream call.
 //!
 //! Two ways past the gate:
@@ -30,10 +31,8 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Either, Full, LengthLimitError, Limited};
-use mcp_usage_kit::{
-    API_KEY_HEADER, LimitDecision, LimitReason, METHOD_HEADER, MeterBody, Method, NAME_HEADER,
-    assess_limits,
-};
+use mcp_usage_kit::tower::{ClassifiedCall, classify_request_headers, extract_api_key};
+use mcp_usage_kit::{LimitDecision, LimitReason, MeterBody, TenantStore, assess_limits};
 use tower::{Layer, Service};
 
 use crate::control_plane::ControlPlaneTenantStore;
@@ -52,6 +51,7 @@ pub struct AdmissionLayer {
     store: Option<Arc<ControlPlaneTenantStore>>,
     payments: Option<Arc<Payments>>,
     max_body: usize,
+    strict_protocol_version: bool,
 }
 
 impl std::fmt::Debug for AdmissionLayer {
@@ -74,6 +74,7 @@ impl AdmissionLayer {
             store: None,
             payments: None,
             max_body: DEFAULT_MAX_BODY,
+            strict_protocol_version: false,
         }
     }
 
@@ -88,6 +89,13 @@ impl AdmissionLayer {
     #[must_use]
     pub fn with_payments(mut self, payments: Arc<Payments>) -> Self {
         self.payments = Some(payments);
+        self
+    }
+
+    /// Use the same protocol policy as the metering layer.
+    #[must_use]
+    pub const fn with_strict_protocol_version(mut self, strict: bool) -> Self {
+        self.strict_protocol_version = strict;
         self
     }
 
@@ -108,6 +116,7 @@ impl<S> Layer<S> for AdmissionLayer {
             store: self.store.clone(),
             payments: self.payments.clone(),
             max_body: self.max_body,
+            strict_protocol_version: self.strict_protocol_version,
         }
     }
 }
@@ -119,27 +128,14 @@ pub struct AdmissionService<S> {
     store: Option<Arc<ControlPlaneTenantStore>>,
     payments: Option<Arc<Payments>>,
     max_body: usize,
+    strict_protocol_version: bool,
 }
 
 /// The single presented tenant credential, or `None` when absent or ambiguous.
 ///
-/// Deliberately lenient: anything this cannot resolve is passed through so the
-/// meter's own credential gate produces the refusal. Two components disagreeing
-/// about what counts as a valid credential is worse than one doing the work.
+/// Uses the meter's exact credential rules so duplicates cannot reach payments.
 fn presented_key(headers: &HeaderMap) -> Option<&str> {
-    let api_key = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok());
-    let bearer = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|value| {
-            let (scheme, token) = value.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-        });
-
-    match (api_key, bearer) {
-        (Some(key), None) | (None, Some(key)) if !key.is_empty() => Some(key),
-        _ => None,
-    }
+    extract_api_key(headers).ok()
 }
 
 /// Convert metered units into the currency's minor unit, rounding up.
@@ -263,30 +259,21 @@ impl<S> AdmissionService<S> {
     /// overflows. A caller must not turn that into a zero-priced challenge: a
     /// facilitator will happily settle zero, which would make a pricing
     /// failure a free pass through the gate.
-    fn price_for(&self, headers: &HeaderMap, unit_price_micros: u64) -> Option<Priced> {
+    fn price_for(
+        &self,
+        headers: &HeaderMap,
+        classified: &ClassifiedCall,
+        unit_price_micros: u64,
+    ) -> Option<Priced> {
         let store = self.store.as_ref()?;
         let key = presented_key(headers)?;
         let tenant = store.tenant_for(key)?;
 
-        let method = headers
-            .get(METHOD_HEADER)
-            .and_then(|value| value.to_str().ok())?
-            .to_owned();
-        // An absent name is priced, and named, as the empty string rather than
-        // skipped: `units_for` already treats it as "no name", and the
-        // identity has to be a total function or two different calls could
-        // share one.
-        let name = headers
-            .get(NAME_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| mcp_usage_kit::core::name::decode(value).ok())
-            .map(std::borrow::Cow::into_owned)
-            .unwrap_or_default();
-
-        let units = tenant.prices.units_for(
-            &Method::parse(&method),
-            (!name.is_empty()).then_some(name.as_str()),
-        );
+        let method = classified.call.method.as_str().to_owned();
+        let name = classified.call.name.clone().unwrap_or_default();
+        let units = tenant
+            .prices
+            .units_for(&classified.call.method, classified.call.name.as_deref());
         Some(Priced {
             method,
             name,
@@ -303,14 +290,22 @@ impl<S> AdmissionService<S> {
     /// the await would force `Self: Sync`, and so the inner service too, which
     /// is a constraint the meter does not owe this layer. The caller already
     /// has a clone, and it is two `Arc`s wide.
-    async fn decide(self, headers: &HeaderMap, body: &[u8]) -> Verdict {
+    async fn decide(
+        self,
+        headers: &HeaderMap,
+        body: &[u8],
+        classified: &ClassifiedCall,
+    ) -> Verdict {
+        if !classified.call.method.delivers_priced_work() {
+            return Verdict::Admit(None);
+        }
         let quota = self
             .store
             .as_ref()
             .and_then(|store| presented_key(headers).and_then(|key| store.quota_for(key)));
         let priced = quota
             .as_ref()
-            .and_then(|(_, unit_price, _)| self.price_for(headers, *unit_price));
+            .and_then(|(_, unit_price, _)| self.price_for(headers, classified, *unit_price));
         let mut payment_error = None;
 
         // A presented credential is checked on its own terms and first. It is
@@ -430,15 +425,25 @@ where
         Box::pin(async move {
             let (mut parts, body) = request.into_parts();
 
-            // Only payments need the body, to bind a challenge to a digest of
-            // it. With no payments configured the stream is passed straight
-            // through, so a plain metering sidecar does not pay for a copy it
-            // never reads.
-            let (collected, body) = if gate.payments.is_some() {
-                // `Limited` aborts as soon as the cap is crossed. Collecting
-                // first and measuring afterwards would let an unauthenticated
-                // client spend the sidecar's memory before any credential is
-                // looked at.
+            // Invalid headers or credentials go directly to the meter's rejection
+            // path, including its authentication failure limiter. No payment work runs.
+            let classification =
+                classify_request_headers(&parts.headers, gate.strict_protocol_version);
+            let authenticated = gate.store.as_ref().is_some_and(|store| {
+                presented_key(&parts.headers)
+                    .and_then(|key| store.authenticate(key))
+                    .is_some()
+            });
+            let (Ok(classification), true) = (classification, authenticated) else {
+                parts.headers.remove(crate::mpp::PAYMENT_AUTHORIZATION);
+                return inner
+                    .call(Request::from_parts(parts, Either::Left(body)))
+                    .await;
+            };
+
+            // Read a bounded body after authentication. Legacy requests need it for
+            // classification; payments also bind their challenge to its digest.
+            let (collected, body) = if gate.store.is_some() {
                 match Limited::new(body, max_body).collect().await {
                     Ok(collected) => {
                         let bytes = collected.to_bytes();
@@ -462,7 +467,23 @@ where
                 (Bytes::new(), Either::Left(body))
             };
 
-            let verdict = gate.decide(&parts.headers, &collected).await;
+            let Ok(classified) = classification.resolve(&parts.method, &collected) else {
+                return Ok(bad_request("invalid_mcp_request"));
+            };
+            if parts
+                .headers
+                .get_all(crate::mpp::PAYMENT_AUTHORIZATION)
+                .iter()
+                .count()
+                > 1
+            {
+                return Ok(bad_request("ambiguous_payment_credential"));
+            }
+            let verdict = if let Some(classified) = classified {
+                gate.decide(&parts.headers, &collected, &classified).await
+            } else {
+                Verdict::Admit(None)
+            };
             let receipt = match verdict {
                 Verdict::Refuse(response) => return Ok(*response),
                 Verdict::Admit(receipt) => receipt,

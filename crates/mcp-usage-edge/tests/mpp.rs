@@ -704,3 +704,97 @@ async fn a_body_inside_the_limit_still_passes() {
     let answer = h.call("sum", None).await;
     assert_eq!(answer.status, StatusCode::PAYMENT_REQUIRED);
 }
+
+#[tokio::test]
+async fn legacy_payment_price_uses_body_and_invalid_headers_never_verify() {
+    let mut snapshot = over_quota_snapshot();
+    snapshot.tenants[0].prices = mcp_usage_kit::PriceBook::flat(1)
+        .with_name("expensive", 100)
+        .with_name("free", 0);
+    let h = harness_with(Duration::from_secs(300), snapshot, 4096).await;
+    let body = Harness::body_for("expensive");
+    let make = |payment: Option<&str>| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{}/mcp", h.addr))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "free");
+        if let Some(payment) = payment {
+            req = req.header("payment-authorization", payment);
+        }
+        req.body(Full::new(Bytes::from(body.clone()))).unwrap()
+    };
+    let response = h.client.request(make(None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge = parse_challenge(response.headers());
+    let request: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&challenge["request"]).unwrap()).unwrap();
+    assert_eq!(request["amount"], "10");
+    response.into_body().collect().await.unwrap();
+    let proof = credential(&challenge, |_| {});
+    for (name, value, expected) in [
+        ("mcp-method", "tools/call", StatusCode::BAD_REQUEST),
+        ("mcp-name", "free", StatusCode::BAD_REQUEST),
+        (
+            "mcp-protocol-version",
+            "2025-11-25",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("authorization", "Bearer wrong", StatusCode::UNAUTHORIZED),
+        ("x-api-key", KEY, StatusCode::UNAUTHORIZED),
+    ] {
+        let mut req = make(Some(&proof));
+        req.headers_mut()
+            .append(http::HeaderName::from_static(name), value.parse().unwrap());
+        let response = h.client.request(req).await.unwrap();
+        assert_eq!(response.status(), expected, "{name}");
+        response.into_body().collect().await.unwrap();
+    }
+    let mut malformed = make(Some(&proof));
+    malformed
+        .headers_mut()
+        .insert("mcp-protocol-version", "garbage".parse().unwrap());
+    assert_eq!(
+        h.client.request(malformed).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(h.facilitator.calls(), 0);
+    assert!(h.upstream_headers.lock().unwrap().is_empty());
+    let response = h.client.request(make(Some(&proof))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(h.facilitator.calls(), 1);
+    assert_eq!(h.facilitator.last().unwrap()["request"]["amount"], "10");
+}
+
+#[tokio::test]
+async fn an_over_quota_tenant_can_finish_legacy_transport_and_control_messages() {
+    let h = harness(Duration::from_secs(300)).await;
+    for (method, body) in [
+        ("GET", ""),
+        ("DELETE", ""),
+        ("POST", r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
+        (
+            "POST",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        ),
+        ("POST", r#"{"jsonrpc":"2.0","id":"server-1","result":{}}"#),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("http://{}/mcp", h.addr))
+            .header("x-api-key", KEY)
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", "session")
+            .header("last-event-id", "event")
+            .body(Full::new(Bytes::from_static(body.as_bytes())))
+            .unwrap();
+        let response = h.client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+    assert_eq!(h.facilitator.calls(), 0);
+    assert_eq!(h.upstream_headers.lock().unwrap().len(), 5);
+}

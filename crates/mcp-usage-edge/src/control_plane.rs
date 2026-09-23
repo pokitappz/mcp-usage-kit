@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Request, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use mcp_usage_kit::{
     AggregatedUsage, Limits, MeterEventOutcome, MeterEventProvider, MeterEventProviderError,
     MeterEventProviderFuture, PriceBook, Tenant, TenantStore, Usage, hash_api_key,
@@ -107,6 +107,7 @@ pub struct PlaneClient {
     base: String,
     token: String,
     timeout: Duration,
+    max_response_bytes: usize,
 }
 
 impl std::fmt::Debug for PlaneClient {
@@ -128,7 +129,15 @@ impl PlaneClient {
             base: base_url.trim_end_matches('/').to_owned(),
             token,
             timeout,
+            max_response_bytes: 16 * 1024 * 1024,
         }
+    }
+
+    /// Limit bytes retained from any control-plane response.
+    #[must_use]
+    pub const fn with_max_response_bytes(mut self, bytes: usize) -> Self {
+        self.max_response_bytes = bytes;
+        self
     }
 
     async fn call<T: for<'de> Deserialize<'de>>(
@@ -152,22 +161,25 @@ impl PlaneClient {
             .body(Full::new(body.unwrap_or_default()))
             .map_err(|_| PlaneError::Malformed)?;
 
-        let response = tokio::time::timeout(self.timeout, self.client.request(request))
-            .await
-            .map_err(|_| PlaneError::Unreachable)?
-            .map_err(|_| PlaneError::Unreachable)?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(PlaneError::Status(status));
-        }
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|_| PlaneError::Unreachable)?
-            .to_bytes();
-        serde_json::from_slice(&bytes).map_err(|_| PlaneError::Malformed)
+        tokio::time::timeout(self.timeout, async {
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|_| PlaneError::Unreachable)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(PlaneError::Status(status));
+            }
+            let bytes = Limited::new(response.into_body(), self.max_response_bytes)
+                .collect()
+                .await
+                .map_err(|_| PlaneError::Malformed)?
+                .to_bytes();
+            serde_json::from_slice(&bytes).map_err(|_| PlaneError::Malformed)
+        })
+        .await
+        .map_err(|_| PlaneError::Unreachable)?
     }
 
     /// Fetch the current snapshot.

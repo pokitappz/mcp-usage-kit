@@ -573,6 +573,7 @@ pub struct FacilitatorMethod {
     endpoint: String,
     token: Option<String>,
     timeout: Duration,
+    max_response_bytes: usize,
 }
 
 impl std::fmt::Debug for FacilitatorMethod {
@@ -610,7 +611,14 @@ impl FacilitatorMethod {
             endpoint,
             token,
             timeout,
+            max_response_bytes: 64 * 1024,
         }
+    }
+    /// Limit bytes retained from a facilitator verdict.
+    #[must_use]
+    pub const fn with_max_response_bytes(mut self, bytes: usize) -> Self {
+        self.max_response_bytes = bytes;
+        self
     }
 }
 
@@ -649,29 +657,25 @@ impl PaymentMethod for FacilitatorMethod {
 
             // A facilitator that does not answer means the payment is unproven,
             // which must never be read as settled.
-            let response = tokio::time::timeout(self.timeout, self.client.request(request))
+            let bytes = tokio::time::timeout(self.timeout, async {
+                let response = self
+                    .client
+                    .request(request)
+                    .await
+                    .map_err(|_| PaymentError::VerificationFailed)?;
+                if !response.status().is_success() {
+                    return Err(PaymentError::VerificationFailed);
+                }
+                http_body_util::BodyExt::collect(http_body_util::Limited::new(
+                    response.into_body(),
+                    self.max_response_bytes,
+                ))
                 .await
-                .map_err(|_| {
-                    tracing::warn!("facilitator timed out; treating the payment as unverified");
-                    PaymentError::VerificationFailed
-                })?
-                .map_err(|_| {
-                    tracing::warn!("facilitator unreachable; treating the payment as unverified");
-                    PaymentError::VerificationFailed
-                })?;
-
-            if !response.status().is_success() {
-                tracing::warn!(
-                    status = response.status().as_u16(),
-                    "facilitator refused to verify"
-                );
-                return Err(PaymentError::VerificationFailed);
-            }
-
-            let bytes = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .map_err(|_| PaymentError::VerificationFailed)?
-                .to_bytes();
+                .map(http_body_util::Collected::to_bytes)
+                .map_err(|_| PaymentError::VerificationFailed)
+            })
+            .await
+            .map_err(|_| PaymentError::VerificationFailed)??;
             let verdict: FacilitatorVerdict =
                 serde_json::from_slice(&bytes).map_err(|_| PaymentError::VerificationFailed)?;
 

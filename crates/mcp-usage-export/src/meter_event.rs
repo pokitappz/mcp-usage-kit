@@ -412,6 +412,10 @@ impl<P> fmt::Debug for MeterEventExporter<P> {
 }
 
 impl<P: MeterEventProvider> BatchExporter for MeterEventExporter<P> {
+    fn retry_policy(&self) -> crate::RetryPolicy {
+        crate::RetryPolicy::CompleteBatch
+    }
+
     fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
         Box::pin(async move {
             let _lease = self.begin_export(batch)?;

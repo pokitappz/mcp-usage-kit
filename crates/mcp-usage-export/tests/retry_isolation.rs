@@ -199,3 +199,37 @@ async fn retry_and_pending_are_reported_separately() {
         "documented as pending + retry"
     );
 }
+
+#[derive(Default)]
+struct FailingCapture(Mutex<Vec<Vec<AggregatedUsage>>>);
+impl BatchExporter for FailingCapture {
+    fn export<'a>(&'a self, batch: &'a [AggregatedUsage]) -> ExportFuture<'a> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push(batch.to_vec());
+            Err(ExportError::Provider("down".into()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn interleaved_failures_never_merge_batches_or_starve_retries() {
+    let pipeline = BillingPipeline::new(FailingCapture::default());
+    for units in 1..=8 {
+        pipeline
+            .record(UsageEvent::now("t", "customer", "units", units, None))
+            .unwrap();
+        assert!(pipeline.flush().await.is_err());
+    }
+    let attempts = pipeline.exporter().0.lock().unwrap();
+    assert_eq!(attempts[0], attempts[1]);
+    assert_eq!(attempts[0], attempts[3]);
+    assert_eq!(attempts[2], attempts[5]);
+    assert!(attempts.iter().all(|batch| batch.len() == 1));
+    for (index, batch) in attempts.iter().enumerate() {
+        for earlier in &attempts[..index] {
+            if batch[0].identifier == earlier[0].identifier {
+                assert_eq!(batch, earlier);
+            }
+        }
+    }
+}
