@@ -1176,7 +1176,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-overbilling"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "mcp-usage-core",
  "serde",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "proptest",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-edge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-export"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-kit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "mcp-usage-core",
  "mcp-usage-tower",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-usage-tower"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "http",
