@@ -88,22 +88,63 @@ Afterward, configure a trusted publisher for the new crate on crates.io with:
 - Workflow: `release.yml`
 - Environment: `release`
 
-v0.4.0 has a git tag but **no GitHub Release**, because the crates were already
-published by hand and `release.yml` fires on `release: published` - creating one
-would have sent the workflow to republish versions that already exist. Pushing a
-plain tag does not trigger it.
+`release.yml` fires on `release: published`, not on a pushed tag, so tag a
+hand-published first version with a plain tag. The v0.4.0 GitHub Release was
+created after its crates were already out by hand, and its "Publish crates" run
+failed trying to republish them. `scripts/publish-crates.sh` now skips versions
+already on crates.io, so a run like that would succeed without publishing
+anything.
 
 The GitHub `release` environment requires an explicit reviewer and accepts only
 tags matching `v*`. Release tags are immutable. The workflow also verifies that
 the tagged commit is reachable from the current `origin/main`; matching the
 workspace version alone is not sufficient.
 
+## Trusted publishers
+
+The OIDC token `release.yml` obtains is only valid for crates that list this
+repository as a trusted publisher. Being published is not enough: a crate
+without one is refused with `403 Forbidden: The provided access token is not
+valid for crate ...`, after every crate before it in the publish order has
+already gone out.
+
+At v0.5.0 only `mcp-usage-core` and `mcp-usage-export` had one. The workflow
+published those two, stopped at `mcp-usage-tower`, and the other four were
+published by hand from the tag. **Before the next release, confirm every crate
+below has a trusted publisher** (crates.io, the crate's Settings, Trusted
+Publishing), configured as:
+
+- GitHub owner: `pokitappz`
+- Repository: `mcp-usage-kit`
+- Workflow: `release.yml`
+- Environment: `release`
+
+for `mcp-usage-core`, `mcp-usage-export`, `mcp-usage-tower`, `mcp-usage-store`,
+`mcp-usage-kit` and `mcp-usage-edge`.
+
 ## Later releases
 
 Once every crate exists on crates.io and has a trusted publisher, create and
 publish a GitHub release whose tag exactly matches the workspace version, such
 as `v0.3.0`. The release workflow validates, packages, obtains a short-lived
-crates.io token through OIDC, and publishes the crates in dependency order. The release commit must already be merged to `main`, and the tag cannot
-be moved or deleted after creation. A release cannot be overwritten or removed
-from crates.io, so verify the tag and generated packages before approving the
+crates.io token through OIDC, and publishes the crates in dependency order. The
+release commit must already be merged to `main`, and the tag cannot be moved or
+deleted after creation. A release cannot be overwritten or removed from
+crates.io, so verify the tag and generated packages before approving the
 environment.
+
+## Recovering a partial release
+
+`scripts/publish-crates.sh` skips any crate whose version is already on
+crates.io, so a release that stopped partway can be finished by re-running the
+failed workflow run once the cause is fixed. A 403 fails immediately rather than
+retrying; fix the trusted publisher, then re-run.
+
+If the workflow cannot be used, publish the remaining crates by hand with an
+API token from a clean checkout of the tag, in the order
+`scripts/publish-crates.sh` lists them:
+
+```sh
+git switch --detach vX.Y.Z
+cargo publish --package <crate> --locked
+```
