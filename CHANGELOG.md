@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-11
+
+Breaking only for the `opentelemetry` feature and for code that builds the
+sidecar's configuration structs by literal. Everything else is additive. The
+reasoning behind each fix is in `docs/audit-remediation.md`.
+
+### Changed
+
+- **Breaking.** The `opentelemetry` feature of `mcp-usage-tower` and
+  `mcp-usage-kit` now depends on `opentelemetry` 0.33, so `install_opentelemetry`
+  takes a 0.33 `Meter`. A caller on 0.32 must upgrade its own `opentelemetry`
+  to match.
+- **Breaking.** `mcp-usage-edge`'s configuration structs gained public fields
+  (`shutdown_timeout_seconds`, and `max_response_bytes` on the control-plane and
+  facilitator sections). An exhaustive struct literal needs the new fields; TOML
+  configuration is unaffected because each one has a default.
+- The sidecar parses its configuration with `toml` 1.1. Updated the locked
+  `hyper-util` to 0.1.21, `hyper-rustls` to 0.27.10, and `thiserror` to 2.0.21.
+  The minimum supported Rust version stays at 1.88.
+- Each HTTP client's `timeout_seconds` in the sidecar now covers the whole
+  response, including bounded body collection, not only the response headers.
+- On SIGTERM the sidecar stops accepting, closes tracked connections once their
+  active responses finish, drains deferred accounting, and retries every
+  remaining batch within the shutdown budget. Exhausting that budget logs the
+  outstanding work and exits unsuccessfully.
+
+### Added
+
+- `RetryPolicy` and `BatchExporter::retry_policy`, defaulting to `Interleave`
+  so existing exporters compile unchanged. `MeterEventExporter` reports
+  `CompleteBatch`, and `CompositeExporter` and the sidecar propagate the
+  strictest policy, so a provider's retry progress and identifiers survive an
+  outage.
+- `Classification`, `ClassifiedCall`, `CredentialError`,
+  `classify_request_headers` and `extract_api_key` in `mcp-usage-tower`,
+  re-exported by `mcp-usage-kit`, so admission and metering share one
+  protocol-header validation, credential extraction and body classification.
+- `with_max_response_bytes` on the sidecar's control-plane and facilitator
+  clients, and `AdmissionLayer::with_strict_protocol_version`.
+- `mcp-overbilling`, a measurement harness for how much a request-counting
+  meter overbills real MCP traffic. It is not published.
+
+### Fixed
+
+- A legacy named call could be priced from a field its method does not
+  execute. `resources/read` now reads only `params.uri`, and tools and prompts
+  only `params.name`, so conflicting fields cannot lower the price.
+- Authentication and classification now precede payment verification, and
+  spoofed payment headers are rejected before the facilitator is contacted.
+  Legacy payment challenges bind to the body identity, and transport and
+  control messages no longer require payment for a new call.
+- Authenticated legacy GET, DELETE, notifications and JSON-RPC responses are
+  forwarded without creating a billable call, and session and reconnection
+  headers survive the proxy hop.
+- Periodic exports drain the current deferred-accounting backlog first.
+- A stalled or oversized control-plane or facilitator response body could hold
+  a request past its deadline.
+
 ## [0.4.0] - 2026-09-22
 
 Breaking. Two public signatures changed, both to fix behaviour that was wrong
