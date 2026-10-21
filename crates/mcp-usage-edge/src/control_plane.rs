@@ -41,7 +41,7 @@ pub enum PlaneError {
 }
 
 /// One authenticating key as the plane reports it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SnapshotEntry {
     /// SHA-256 of the tenant key.
     pub api_key_sha256: String,
@@ -66,6 +66,12 @@ pub struct SnapshotEntry {
     /// Spend already committed in the plane's current window.
     #[serde(default)]
     pub committed_spend_micros: u64,
+}
+
+impl std::fmt::Debug for SnapshotEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotEntry").finish_non_exhaustive()
+    }
 }
 
 /// A full replacement view of everything this edge may serve.
@@ -114,7 +120,6 @@ impl std::fmt::Debug for PlaneClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The token is a credential and never belongs in a log line.
         f.debug_struct("PlaneClient")
-            .field("base", &self.base)
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -122,15 +127,25 @@ impl std::fmt::Debug for PlaneClient {
 
 impl PlaneClient {
     /// Construct a client for a control-plane base URL.
-    #[must_use]
-    pub fn new(client: HttpsClient, base_url: &str, token: String, timeout: Duration) -> Self {
-        Self {
+    /// # Errors
+    /// Returns a sanitized error if the endpoint is invalid or insecure.
+    pub fn new(
+        client: HttpsClient,
+        base_url: &str,
+        token: String,
+        timeout: Duration,
+    ) -> Result<Self, crate::endpoint::EndpointError> {
+        crate::endpoint::validate(base_url, false)?;
+        if timeout.is_zero() {
+            return Err(crate::endpoint::EndpointError);
+        }
+        Ok(Self {
             client,
             base: base_url.trim_end_matches('/').to_owned(),
             token,
             timeout,
             max_response_bytes: 16 * 1024 * 1024,
-        }
+        })
     }
 
     /// Limit bytes retained from any control-plane response.
@@ -498,14 +513,14 @@ mod tests {
     fn an_empty_store_authenticates_nothing() {
         // Before the first snapshot the edge knows nobody, so it must refuse
         // rather than fall open.
-        let store = ControlPlaneTenantStore::new(Duration::from_secs(900));
+        let store = ControlPlaneTenantStore::new(Duration::from_mins(15));
         assert!(store.authenticate(KEY).is_none());
         assert!(store.is_stale());
     }
 
     #[test]
     fn a_fresh_snapshot_authenticates_and_carries_prices() {
-        let store = ControlPlaneTenantStore::new(Duration::from_secs(900));
+        let store = ControlPlaneTenantStore::new(Duration::from_mins(15));
         store.apply(snapshot_with(0, None));
 
         let tenant = store.authenticate(KEY).expect("authenticates");
@@ -522,7 +537,7 @@ mod tests {
 
     #[test]
     fn a_key_absent_from_the_snapshot_is_refused() {
-        let store = ControlPlaneTenantStore::new(Duration::from_secs(900));
+        let store = ControlPlaneTenantStore::new(Duration::from_mins(15));
         store.apply(snapshot_with(0, None));
         assert!(
             store
@@ -533,7 +548,7 @@ mod tests {
 
     #[test]
     fn a_refreshed_snapshot_that_drops_a_key_revokes_it() {
-        let store = ControlPlaneTenantStore::new(Duration::from_secs(900));
+        let store = ControlPlaneTenantStore::new(Duration::from_mins(15));
         store.apply(snapshot_with(0, None));
         assert!(store.authenticate(KEY).is_some());
 
@@ -556,7 +571,7 @@ mod tests {
 
     #[test]
     fn quota_state_comes_back_with_the_key() {
-        let store = ControlPlaneTenantStore::new(Duration::from_secs(900));
+        let store = ControlPlaneTenantStore::new(Duration::from_mins(15));
         store.apply(snapshot_with(42, Some(100)));
         let (usage, price, limits) = store.quota_for(KEY).expect("known key");
         assert_eq!(usage.units, 42);

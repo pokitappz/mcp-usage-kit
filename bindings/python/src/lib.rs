@@ -23,6 +23,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
+mod json;
+
 /// The conformance schema this build implements.
 const CONFORMANCE_SCHEMA_VERSION: u64 = 1;
 
@@ -134,7 +136,7 @@ impl PriceBook {
 }
 
 /// What a single exchange is worth.
-#[pyclass(module = "mcp_usage_kit", frozen, get_all, skip_from_py_object)]
+#[pyclass(module = "mcp_usage_kit", frozen, get_all)]
 #[derive(Clone)]
 pub struct ChargeResult {
     /// Whether this records delivered work. Zero-priced work is still billable.
@@ -200,7 +202,7 @@ impl From<Charge> for ChargeResult {
 }
 
 /// The outcome of a quota and spend-cap check.
-#[pyclass(module = "mcp_usage_kit", frozen, get_all, skip_from_py_object)]
+#[pyclass(module = "mcp_usage_kit", frozen, get_all)]
 #[derive(Clone)]
 pub struct LimitOutcome {
     /// Whether the reservation may proceed.
@@ -245,11 +247,7 @@ fn to_json(response: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
             PyValueError::new_err(format!("response is not valid JSON: {error}"))
         });
     }
-    pythonize::depythonize(response).map_err(|error| {
-        PyValueError::new_err(format!(
-            "response could not be read as JSON-compatible data: {error}"
-        ))
-    })
+    json::from_python(response)
 }
 
 /// Accounting for one MCP server, against one price book.
@@ -383,9 +381,7 @@ fn decode_name(header_value: &str) -> PyResult<String> {
 
 /// Build a JSON-RPC response envelope as a Python mapping.
 fn envelope(py: Python<'_>, body: &serde_json::Value) -> PyResult<Py<PyAny>> {
-    pythonize::pythonize(py, body)
-        .map(pyo3::Bound::unbind)
-        .map_err(|error| PyValueError::new_err(format!("could not build a response: {error}")))
+    json::to_python(py, body)
 }
 
 /// A response for work that was delivered.

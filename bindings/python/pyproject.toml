@@ -1,11 +1,11 @@
 [build-system]
-requires = ["maturin>=1.9,<2.0"]
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "mcp-usage-kit"
 description = "Protocol-correct usage accounting for MCP servers."
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 readme = "README.md"
 keywords = ["mcp", "billing", "metering", "fastmcp"]
@@ -22,7 +22,7 @@ Repository = "https://github.com/pokitappz/mcp-usage-kit"
 
 [tool.maturin]
 # One wheel per platform rather than per Python version: the extension is built
-# against the stable ABI, so 3.9 and 3.13 share a binary.
+# against the stable ABI, so 3.11 and 3.15 share a binary.
 features = ["pyo3/extension-module"]
 module-name = "mcp_usage_kit"
 strip = true

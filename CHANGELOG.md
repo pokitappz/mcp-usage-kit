@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-21
+
+A security release for the `mcp-usage-edge` sidecar, with dependency updates
+across the workspace. Breaking for sidecar payment configuration, for
+`mcp-usage-store`'s Postgres backend, and for the Python binding's minimum
+Python version.
+
+### Security
+
+- Payment proofs are reserved in a shared Redis replay store instead of a
+  process-local cache, so a proof cannot be redeemed twice across replicas or
+  after a restart. Payments now require the `redis` feature and a
+  `[mpp.replay_store]` section; the sidecar refuses to start without one, and an
+  unavailable store refuses paid admission with `503` rather than falling open.
+- Payment challenges are bound to the authenticated tenant, so a challenge
+  issued to one tenant cannot be redeemed by another. Challenge ids are checked
+  with the HMAC's own constant-time verification.
+- A facilitator outage or malformed facilitator response is reported as
+  unavailable rather than as a definite rejection, and only an explicit
+  non-settlement releases a reservation.
+- Every outbound endpoint (upstream, control plane, facilitator) is validated
+  in one place: HTTPS only, with plaintext allowed only on literal loopback (or
+  for the upstream), and no userinfo, query or fragment.
+- New transport layer: exact `allowed_origins` checks on `Origin`, rejection of
+  hop-by-hop header abuse, a request-body deadline (`body_timeout_seconds`), a
+  header-read timeout (`header_timeout_seconds`), and a connection cap
+  (`max_connections`). Security headers are added to sidecar responses.
+- `credential_forwarding` now defaults to `false`, and authentication failure
+  limiting is on by default (100 failures per 60 seconds).
+- Configuration, tenant and snapshot errors and `Debug` output no longer echo
+  URLs, API keys, tenant ids or TOML contents. Payment signing secrets must be
+  at least 32 bytes.
+- The Python binding converts responses with a bounded, cycle-checked JSON
+  converter that never calls arbitrary Python serialization hooks, replacing
+  `pythonize`.
+
+### Changed
+
+- **Breaking.** `Payments::new`, `PlaneClient::new` and `FacilitatorMethod::new`
+  now return `Result`, and `Payments::new` takes a `ReplayStore`.
+  `MppSettings::replay_capacity` is replaced by `replay_store`.
+- **Breaking.** `mcp-usage-store`'s Postgres backend uses `sqlx` 0.9, so
+  `PostgresTaskStore::new` takes a 0.9 `PgPool`.
+- **Breaking.** The Python binding requires Python 3.11 or newer (abi3-py311)
+  and builds on PyO3 0.30.
+- The minimum supported Rust version is now 1.94. The repository pins its
+  toolchain to 1.99.1 in `rust-toolchain.toml`, CI and the release workflow.
+- Updated dependencies, including `rmcp` 3.6, `tokio` 1.54, `hyper` 1.12,
+  `rustls` 0.23.46, `redis` 1.7.1, `opentelemetry` 0.33.1, `serde_json`
+  1.0.154, `uuid` 1.28 and `proptest` 1.12.
+- The sidecar image builds with the `redis` feature on Debian 13, and its base
+  images are pinned by digest. Python CI tests 3.11 through 3.15 with
+  hash-locked tooling.
+
 ## [0.5.0] - 2026-10-11
 
 Breaking only for the `opentelemetry` feature and for code that builds the

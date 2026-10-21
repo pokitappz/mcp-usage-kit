@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directories: ["/", "/bindings/python", "/fuzz"]
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -10,3 +10,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /crates/mcp-usage-edge
+    schedule:
+      interval: weekly

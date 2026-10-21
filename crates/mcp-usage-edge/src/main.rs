@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use mcp_usage_kit::{
     AggregatedUsage, BatchExporter, BillingPipeline, EdgeConfig, ExportError, ExportFuture,
@@ -96,7 +96,7 @@ fn tenant_source(
             &settings.url,
             settings.token()?,
             settings.timeout(),
-        )
+        )?
         .with_max_response_bytes(settings.max_response_bytes);
         let store = Arc::new(ControlPlaneTenantStore::new(settings.max_stale()));
         return Ok((store.clone(), Some(client), Some(store)));
@@ -104,11 +104,10 @@ fn tenant_source(
 
     let store = Arc::new(InMemoryTenantStore::new());
     for (api_key, tenant) in config.resolve_tenants()? {
-        let id = tenant.id.clone();
         // Strength was already checked while resolving, and re-checking here
         // would only re-derive the same verdict.
         store.insert_unchecked(&api_key, tenant);
-        tracing::info!(tenant = %id, "registered tenant");
+        tracing::debug!("registered tenant");
     }
     Ok((store, None, None))
 }
@@ -194,7 +193,7 @@ fn edge_config(
 ///
 /// Quota and payments are independent: either, both, or neither. The layer is
 /// always present so the sidecar has one service type regardless.
-fn admission_gate(
+async fn admission_gate(
     config: &Config,
     cached: Option<&Arc<ControlPlaneTenantStore>>,
     http: &HttpsClient,
@@ -216,7 +215,7 @@ fn admission_gate(
             settings.facilitator.url.clone(),
             settings.facilitator.token()?,
             settings.facilitator.timeout(),
-        )
+        )?
         .with_max_response_bytes(settings.facilitator.max_response_bytes);
         let payments = Payments::new(
             PaymentsConfig {
@@ -226,10 +225,10 @@ fn admission_gate(
                 currency: settings.currency.clone(),
                 recipient: settings.recipient.clone(),
                 ttl: settings.challenge_ttl(),
-                replay_capacity: settings.replay_capacity,
             },
             Box::new(method),
-        );
+            payment_replay(settings).await?,
+        )?;
         tracing::info!(
             method = %settings.method,
             realm = %settings.realm,
@@ -270,7 +269,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         start_refresh(store.clone(), client.clone(), settings.refresh_interval()).await;
     }
 
-    let gate = admission_gate(&config, cached.as_ref(), &http)?;
+    let gate = admission_gate(&config, cached.as_ref(), &http).await?;
 
     let proxy = UpstreamProxy::with_client(
         http.clone(),
@@ -278,12 +277,15 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.upstream.timeout(),
     )?;
     let deferred = edge.deferred();
-    let service = gate.layer(MeterLayer::new(edge).layer(proxy));
+    let service = mcp_usage_edge::transport::TransportLayer::new(
+        config.edge.allowed_origins.clone(),
+        std::time::Duration::from_secs(config.edge.body_timeout_seconds),
+    )?
+    .layer(gate.layer(MeterLayer::new(edge).layer(proxy)));
 
     let listener = TcpListener::bind(config.listen).await?;
     tracing::info!(
         listen = %config.listen,
-        upstream = %config.upstream.url,
         credential_forwarding = config.edge.credential_forwarding,
         "metering sidecar ready"
     );
@@ -303,8 +305,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result { tracing::warn!(%error, "connection task failed"); }
             }
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
+            accepted = listener.accept(), if connections.len() < config.edge.max_connections => {
+                let (stream, _peer) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         tracing::warn!(%error, "accept failed");
@@ -313,9 +315,10 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let connection_service = TowerToHyperService::new(service.clone());
                 let mut stopping = stopping.clone();
+                let header_timeout = std::time::Duration::from_secs(config.edge.header_timeout_seconds);
                 connections.spawn(async move {
                     let io = TokioIo::new(stream);
-                    let connection = http1::Builder::new().serve_connection(io, connection_service);
+                    let connection = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(header_timeout).serve_connection(io, connection_service);
                     tokio::pin!(connection);
                     let result = tokio::select! {
                         result = &mut connection => result,
@@ -325,7 +328,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     if let Err(error) = result {
-                        tracing::debug!(%peer, %error, "connection closed");
+                        tracing::debug!(%error, "connection closed");
                     }
                 });
             }
@@ -547,4 +550,30 @@ fn install_crypto_provider() {
     {
         tracing::debug!("a rustls crypto provider was already installed");
     }
+}
+
+#[cfg(feature = "redis")]
+async fn payment_replay(
+    settings: &mcp_usage_edge::config::MppSettings,
+) -> Result<Arc<dyn mcp_usage_edge::replay::ReplayStore>, Box<dyn std::error::Error>> {
+    let store = &settings.replay_store;
+    Ok(Arc::new(
+        mcp_usage_edge::replay::RedisReplayStore::connect(
+            &store.url()?,
+            &store.key_prefix,
+            std::time::Duration::from_secs(store.timeout_seconds),
+        )
+        .await?,
+    ))
+}
+
+#[cfg(not(feature = "redis"))]
+#[expect(
+    clippy::unused_async,
+    reason = "matches the Redis-enabled configuration path"
+)]
+async fn payment_replay(
+    _settings: &mcp_usage_edge::config::MppSettings,
+) -> Result<Arc<dyn mcp_usage_edge::replay::ReplayStore>, Box<dyn std::error::Error>> {
+    Err(mcp_usage_edge::config::ConfigError::ReplayStore.into())
 }

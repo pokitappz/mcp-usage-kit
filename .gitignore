@@ -3,3 +3,7 @@
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+
+/bindings/python/dist/
+/bindings/python/.pytest_cache/
+**/__pycache__/

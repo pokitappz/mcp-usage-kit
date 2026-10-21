@@ -68,6 +68,10 @@ pub enum PaymentError {
     MethodUnsupported,
     /// The proof did not verify, or has already been spent.
     VerificationFailed,
+    /// A verifier explicitly confirmed that no settlement occurred.
+    NotSettled,
+    /// Verification or shared replay protection is unavailable; outcome is unknown.
+    Unavailable,
     /// The proof was for less than the challenge asked.
     Insufficient,
 }
@@ -85,7 +89,9 @@ impl PaymentError {
             Self::InvalidChallenge => "invalid-challenge",
             Self::Expired => "payment-expired",
             Self::MethodUnsupported => "method-unsupported",
-            Self::VerificationFailed => "verification-failed",
+            Self::VerificationFailed | Self::NotSettled | Self::Unavailable => {
+                "verification-failed"
+            }
             Self::Insufficient => "payment-insufficient",
         };
         format!("{PROBLEM_BASE}{code}")
@@ -101,7 +107,8 @@ impl PaymentError {
             Self::Expired => "Payment challenge expired",
             Self::DigestMismatch => "Request body does not match the challenge",
             Self::MethodUnsupported => "Unsupported payment method",
-            Self::VerificationFailed => "Payment verification failed",
+            Self::VerificationFailed | Self::NotSettled => "Payment verification failed",
+            Self::Unavailable => "Payment verification unavailable",
             Self::Insufficient => "Payment insufficient",
         }
     }
@@ -211,6 +218,10 @@ pub struct Binding<'a> {
 /// fallible step here cannot fail.
 #[must_use]
 pub fn challenge_id(secret: &[u8], binding: &Binding<'_>) -> String {
+    URL_SAFE_NO_PAD.encode(binding_mac(secret, binding).finalize().into_bytes())
+}
+
+fn binding_mac(secret: &[u8], binding: &Binding<'_>) -> HmacSha256 {
     let mut input = [
         binding.realm,
         binding.method,
@@ -228,7 +239,7 @@ pub fn challenge_id(secret: &[u8], binding: &Binding<'_>) -> String {
 
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
     mac.update(input.as_bytes());
-    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    mac
 }
 
 /// Quote and escape an auth-param value per RFC 9110 `quoted-string`.
@@ -260,6 +271,8 @@ fn quoted(value: &str) -> String {
 /// receive the same challenge id, and settling one would burn the other.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PricedIdentity {
+    /// Keyed, issuer-specific binding to the authenticated tenant.
+    pub tenant: String,
     /// The MCP method the amount was priced from.
     pub method: String,
     /// The tool, prompt or resource name the amount was priced from.
@@ -273,6 +286,7 @@ impl PricedIdentity {
     #[must_use]
     pub fn encode(&self) -> String {
         let canonical: BTreeMap<&str, &str> = BTreeMap::from([
+            ("tenant", self.tenant.as_str()),
             ("method", self.method.as_str()),
             ("name", self.name.as_str()),
             ("nonce", self.nonce.as_str()),
@@ -371,7 +385,7 @@ impl Challenge {
     /// Re-derive this challenge's binding and compare it to the presented `id`.
     #[must_use]
     pub fn binding_is_valid(&self, secret: &[u8]) -> bool {
-        let expected = challenge_id(
+        let expected = binding_mac(
             secret,
             &Binding {
                 realm: &self.realm,
@@ -384,7 +398,9 @@ impl Challenge {
                 header: self.header.as_deref(),
             },
         );
-        constant_time_eq(expected.as_bytes(), self.id.as_bytes())
+        URL_SAFE_NO_PAD
+            .decode(&self.id)
+            .is_ok_and(|tag| expected.verify_slice(&tag).is_ok())
     }
 
     /// The decoded payment request, when it is the shape this server issues.
@@ -393,17 +409,6 @@ impl Challenge {
         let raw = URL_SAFE_NO_PAD.decode(&self.request).ok()?;
         serde_json::from_slice(&raw).ok()
     }
-}
-
-/// Compare without leaking how much of the value matched.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |differences, (a, b)| differences | (a ^ b))
-        == 0
 }
 
 /// The challenge as echoed inside a credential.
@@ -580,7 +585,6 @@ impl std::fmt::Debug for FacilitatorMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FacilitatorMethod")
             .field("method", &self.method)
-            .field("endpoint", &self.endpoint)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish_non_exhaustive()
     }
@@ -597,22 +601,27 @@ struct FacilitatorVerdict {
 
 impl FacilitatorMethod {
     /// Point at a facilitator for one payment method.
-    #[must_use]
+    /// # Errors
+    /// Returns a sanitized error for an invalid or insecure endpoint.
     pub fn new(
         client: crate::proxy::HttpsClient,
         method: String,
         endpoint: String,
         token: Option<String>,
         timeout: Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::endpoint::EndpointError> {
+        crate::endpoint::validate(&endpoint, false)?;
+        if timeout.is_zero() {
+            return Err(crate::endpoint::EndpointError);
+        }
+        Ok(Self {
             client,
             method,
             endpoint,
             token,
             timeout,
             max_response_bytes: 64 * 1024,
-        }
+        })
     }
     /// Limit bytes retained from a facilitator verdict.
     #[must_use]
@@ -653,7 +662,7 @@ impl PaymentMethod for FacilitatorMethod {
             }
             let request = builder
                 .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-                .map_err(|_| PaymentError::VerificationFailed)?;
+                .map_err(|_| PaymentError::Unavailable)?;
 
             // A facilitator that does not answer means the payment is unproven,
             // which must never be read as settled.
@@ -662,9 +671,9 @@ impl PaymentMethod for FacilitatorMethod {
                     .client
                     .request(request)
                     .await
-                    .map_err(|_| PaymentError::VerificationFailed)?;
+                    .map_err(|_| PaymentError::Unavailable)?;
                 if !response.status().is_success() {
-                    return Err(PaymentError::VerificationFailed);
+                    return Err(PaymentError::Unavailable);
                 }
                 http_body_util::BodyExt::collect(http_body_util::Limited::new(
                     response.into_body(),
@@ -672,22 +681,22 @@ impl PaymentMethod for FacilitatorMethod {
                 ))
                 .await
                 .map(http_body_util::Collected::to_bytes)
-                .map_err(|_| PaymentError::VerificationFailed)
+                .map_err(|_| PaymentError::Unavailable)
             })
             .await
-            .map_err(|_| PaymentError::VerificationFailed)??;
+            .map_err(|_| PaymentError::Unavailable)??;
             let verdict: FacilitatorVerdict =
-                serde_json::from_slice(&bytes).map_err(|_| PaymentError::VerificationFailed)?;
+                serde_json::from_slice(&bytes).map_err(|_| PaymentError::Unavailable)?;
 
             if !verdict.settled {
                 return Err(match verdict.reason.as_deref() {
                     Some("insufficient") => PaymentError::Insufficient,
-                    _ => PaymentError::VerificationFailed,
+                    _ => PaymentError::NotSettled,
                 });
             }
             // A settlement with no reference cannot be reconciled later, so it
             // is not something to hand back in a receipt.
-            verdict.reference.ok_or(PaymentError::VerificationFailed)
+            verdict.reference.ok_or(PaymentError::Unavailable)
         })
     }
 }
@@ -778,7 +787,7 @@ impl ReplayGuard {
 }
 
 /// Everything a [`Payments`] needs except its verification method.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PaymentsConfig {
     /// Secret the challenge binding is computed under.
     pub secret: Vec<u8>,
@@ -792,8 +801,6 @@ pub struct PaymentsConfig {
     pub recipient: String,
     /// How long a challenge stays answerable.
     pub ttl: Duration,
-    /// How many spent proofs to hold at once.
-    pub replay_capacity: usize,
 }
 
 /// How this sidecar issues and checks challenges.
@@ -805,7 +812,8 @@ pub struct Payments {
     recipient: String,
     ttl: Duration,
     method: Box<dyn PaymentMethod>,
-    replay: ReplayGuard,
+    replay: std::sync::Arc<dyn crate::replay::ReplayStore>,
+    retain_for: Duration,
 }
 
 impl std::fmt::Debug for Payments {
@@ -821,10 +829,23 @@ impl std::fmt::Debug for Payments {
 }
 
 impl Payments {
-    /// Construct from a verified configuration.
-    #[must_use]
-    pub fn new(config: PaymentsConfig, method: Box<dyn PaymentMethod>) -> Self {
-        Self {
+    /// Construct with an explicit replay backend. The sidecar requires Redis.
+    ///
+    /// # Errors
+    /// Rejects short signing secrets, zero lifetimes and unrepresentable retention.
+    pub fn new(
+        config: PaymentsConfig,
+        method: Box<dyn PaymentMethod>,
+        replay: std::sync::Arc<dyn crate::replay::ReplayStore>,
+    ) -> Result<Self, PaymentsConfigError> {
+        let retain_for = config.ttl.checked_mul(2).ok_or(PaymentsConfigError)?;
+        if config.secret.len() < 32
+            || config.ttl.is_zero()
+            || Instant::now().checked_add(retain_for).is_none()
+        {
+            return Err(PaymentsConfigError);
+        }
+        Ok(Self {
             secret: config.secret,
             realm: config.realm,
             intent: config.intent,
@@ -832,11 +853,17 @@ impl Payments {
             recipient: config.recipient,
             ttl: config.ttl,
             method,
-            // Retained for twice the challenge lifetime: anything older is
-            // already refused by the expiry check, and the margin covers
-            // clock skew between issue and redemption.
-            replay: ReplayGuard::new(config.replay_capacity, config.ttl.saturating_mul(2)),
-        }
+            replay,
+            retain_for,
+        })
+    }
+
+    fn tenant_binding(&self, tenant: &str) -> String {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        mac.update(b"mcp-usage-tenant-v1\0");
+        mac.update(tenant.as_bytes());
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
     /// The method identifier challenges are issued for.
@@ -851,6 +878,7 @@ impl Payments {
     pub fn challenge(
         &self,
         amount_minor: u64,
+        tenant: &str,
         identity: (&str, &str),
         body: &[u8],
         now: &chrono_lite::Rfc3339,
@@ -873,6 +901,7 @@ impl Payments {
                 digest: Some(content_digest(body)),
                 description: None,
                 identity: Some(PricedIdentity {
+                    tenant: self.tenant_binding(tenant),
                     method: identity.0.to_owned(),
                     name: identity.1.to_owned(),
                     nonce: uuid::Uuid::new_v4().to_string(),
@@ -896,6 +925,7 @@ impl Payments {
     pub async fn verify(
         &self,
         header_value: &str,
+        tenant: &str,
         body: &[u8],
         identity: (&str, &str),
         amount_minor: u64,
@@ -916,13 +946,18 @@ impl Payments {
         if challenge.method != self.method.method() {
             return Err(PaymentError::MethodUnsupported);
         }
-        if let Some(expires) = challenge.expires.as_deref()
-            && now.is_after(expires)
-        {
+        let expires = challenge
+            .expires
+            .as_deref()
+            .ok_or(PaymentError::InvalidChallenge)?;
+        if now.is_after(expires) || expires > now.plus(self.ttl).as_str() {
             return Err(PaymentError::Expired);
         }
+        if challenge.digest.is_none() {
+            return Err(PaymentError::InvalidChallenge);
+        }
         if let Some(digest) = challenge.digest.as_deref()
-            && !constant_time_eq(digest.as_bytes(), content_digest(body).as_bytes())
+            && digest != content_digest(body)
         {
             return Err(PaymentError::DigestMismatch);
         }
@@ -932,7 +967,10 @@ impl Payments {
             .as_deref()
             .and_then(PricedIdentity::decode)
             .ok_or(PaymentError::InvalidChallenge)?;
-        if issued.method != identity.0 || issued.name != identity.1 {
+        if issued.tenant != self.tenant_binding(tenant)
+            || issued.method != identity.0
+            || issued.name != identity.1
+        {
             tracing::warn!("a credential was presented under a different priced identity");
             return Err(PaymentError::InvalidChallenge);
         }
@@ -951,21 +989,27 @@ impl Payments {
         // credential cannot both reach the method and settle twice. Released
         // again below if it does not settle, because holding it would let
         // anyone burn a slot for the price of a junk payload.
-        if !self.replay.reserve(&challenge.id) {
-            tracing::warn!("refusing a replayed or contended payment credential");
-            return Err(PaymentError::VerificationFailed);
-        }
-
+        let reservation = self
+            .replay
+            .reserve(&challenge.id, self.retain_for)
+            .await
+            .map_err(|_| PaymentError::Unavailable)?
+            .ok_or(PaymentError::VerificationFailed)?;
         match self.method.verify(&credential, &request).await {
             Ok(reference) => Ok(Receipt::new(
                 challenge.method.clone(),
                 reference,
                 now.to_string(),
             )),
-            Err(error) => {
-                self.replay.release(&challenge.id);
+            Err(error @ (PaymentError::NotSettled | PaymentError::Insufficient)) => {
+                self.replay
+                    .release(&reservation)
+                    .await
+                    .map_err(|_| PaymentError::Unavailable)?;
                 Err(error)
             }
+            // Cancellation and ambiguous outcomes retain the reservation.
+            Err(error) => Err(error),
         }
     }
 }
@@ -1146,6 +1190,7 @@ mod tests {
             digest,
             description: None,
             identity: Some(PricedIdentity {
+                tenant: "tenant-fixture".to_owned(),
                 method: "tools/call".to_owned(),
                 name: "search".to_owned(),
                 nonce: "fixed-for-determinism".to_owned(),
@@ -1451,6 +1496,7 @@ mod tests {
                     digest: Some(content_digest(b"body")),
                     description: None,
                     identity: Some(PricedIdentity {
+                        tenant: "tenant-fixture".to_owned(),
                         method: "tools/call".to_owned(),
                         name: "sum".to_owned(),
                         nonce: uuid::Uuid::new_v4().to_string(),
@@ -1464,6 +1510,7 @@ mod tests {
     #[test]
     fn the_priced_identity_round_trips_through_opaque() {
         let identity = PricedIdentity {
+            tenant: "tenant-fixture".to_owned(),
             method: "tools/call".to_owned(),
             name: "sum".to_owned(),
             nonce: "n".to_owned(),
@@ -1482,6 +1529,7 @@ mod tests {
         let mut tampered = challenge.clone();
         tampered.opaque = Some(
             PricedIdentity {
+                tenant: "tenant-fixture".to_owned(),
                 method: "tools/call".to_owned(),
                 name: "expensive".to_owned(),
                 nonce: "n".to_owned(),
@@ -1489,5 +1537,19 @@ mod tests {
             .encode(),
         );
         assert!(!tampered.binding_is_valid(SECRET));
+    }
+}
+
+/// Invalid payment signing secret or challenge lifetime.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("payment signing secrets require at least 32 bytes and a positive, bounded lifetime")]
+pub struct PaymentsConfigError;
+
+impl std::fmt::Debug for PaymentsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentsConfig")
+            .field("secret", &"[REDACTED]")
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
     }
 }
