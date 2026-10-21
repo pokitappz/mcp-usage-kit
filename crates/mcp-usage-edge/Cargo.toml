@@ -29,9 +29,10 @@ tls = ["dep:hyper-rustls", "dep:rustls"]
 # more than a single instance loses that revenue. Redis rather than Postgres
 # because a sidecar should not drag SQLx in; an application that already has a
 # pool can embed the library and pass `PostgresTaskStore` directly.
-redis = ["mcp-usage-kit/redis"]
+redis = ["mcp-usage-kit/redis", "dep:redis"]
 
 [dependencies]
+redis = { workspace = true, optional = true }
 mcp-usage-kit = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }

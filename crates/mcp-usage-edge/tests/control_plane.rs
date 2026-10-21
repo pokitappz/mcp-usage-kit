@@ -212,7 +212,8 @@ async fn harness(max_stale: Duration, refresh: Duration, enforce_quota: bool) ->
         &format!("http://{plane_addr}"),
         "edge-token".to_owned(),
         Duration::from_secs(2),
-    );
+    )
+    .unwrap();
     let store = Arc::new(ControlPlaneTenantStore::new(max_stale));
     store.apply(client.snapshot().await.expect("initial snapshot"));
     tokio::spawn(refresh_forever(store.clone(), client.clone(), refresh));

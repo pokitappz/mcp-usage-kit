@@ -203,16 +203,20 @@ async fn harness_with(ttl: Duration, snapshot: Snapshot, max_body: usize) -> Har
             currency: "usd".to_owned(),
             recipient: "acct_merchant".to_owned(),
             ttl,
-            replay_capacity: 1024,
         },
-        Box::new(FacilitatorMethod::new(
-            http.clone(),
-            METHOD.to_owned(),
-            format!("http://{facilitator_addr}/verify"),
-            None,
-            Duration::from_secs(2),
-        )),
-    );
+        Box::new(
+            FacilitatorMethod::new(
+                http.clone(),
+                METHOD.to_owned(),
+                format!("http://{facilitator_addr}/verify"),
+                None,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        ),
+        Arc::new(mcp_usage_edge::replay::InMemoryReplayStore::default()),
+    )
+    .unwrap();
 
     let billing = Arc::new(BillingPipeline::new(LogExporter::new()));
     // Matches the sidecar's own default rather than the library's: the
@@ -602,12 +606,11 @@ async fn an_unreachable_facilitator_never_admits_the_call() {
     let answer = h.call("sum", Some(&credential(&challenge, |_| {}))).await;
 
     // An unproven payment must never be read as settled: failing open here
-    // would make an outage at the facilitator a free-service coupon.
-    assert_eq!(answer.status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(
-        problem(&answer),
-        "https://paymentauth.org/problems/verification-failed"
-    );
+    // would make an outage at the facilitator a free-service coupon. Nor is it
+    // a definite rejection, so the client is told to retry rather than pay
+    // again.
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.body["error"], "payment_verification_unavailable");
     assert!(h.upstream_headers.lock().unwrap().is_empty());
 }
 

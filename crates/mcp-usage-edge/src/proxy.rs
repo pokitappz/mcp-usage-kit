@@ -77,6 +77,16 @@ const HOP_BY_HOP: [HeaderName; 8] = [
 ];
 
 fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
+    let nominated: Vec<HeaderName> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in nominated {
+        headers.remove(name);
+    }
     for name in HOP_BY_HOP {
         headers.remove(name);
     }
@@ -96,8 +106,6 @@ impl std::fmt::Debug for UpstreamProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamProxy")
             .field("scheme", &self.scheme)
-            .field("authority", &self.authority.as_str())
-            .field("base_path", &self.base_path)
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -143,9 +151,8 @@ impl UpstreamProxy {
         base_url: &str,
         timeout: Duration,
     ) -> Result<Self, ProxyBuildError> {
-        let uri: Uri = base_url
-            .parse()
-            .map_err(|_| ProxyBuildError::Invalid(base_url.to_owned()))?;
+        let uri = crate::endpoint::validate(base_url, true)
+            .map_err(|_| ProxyBuildError::Invalid("[REDACTED]".to_owned()))?;
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
             return Err(ProxyBuildError::NotAbsolute(base_url.to_owned()));
         };
@@ -336,7 +343,7 @@ mod tests {
     fn a_relative_base_url_is_refused() {
         assert!(matches!(
             UpstreamProxy::new("/mcp", Duration::from_secs(1)),
-            Err(ProxyBuildError::NotAbsolute(_))
+            Err(ProxyBuildError::Invalid(_))
         ));
     }
 
@@ -344,7 +351,7 @@ mod tests {
     fn a_non_http_scheme_is_refused() {
         assert!(matches!(
             UpstreamProxy::new("ftp://origin.internal", Duration::from_secs(1)),
-            Err(ProxyBuildError::UnsupportedScheme(_))
+            Err(ProxyBuildError::Invalid(_))
         ));
     }
 

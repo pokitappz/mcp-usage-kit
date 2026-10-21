@@ -59,6 +59,7 @@ async fn snapshot_body_is_bounded_and_recovers_after_stall_and_oversize() {
         "test".into(),
         Duration::from_millis(150),
     )
+    .unwrap()
     .with_max_response_bytes(64);
     for _ in 0..2 {
         let result = tokio::time::timeout(Duration::from_secs(1), client.snapshot()).await;
@@ -81,6 +82,7 @@ async fn facilitator_body_is_bounded_and_recovers_after_stall_and_oversize() {
         None,
         Duration::from_millis(150),
     )
+    .unwrap()
     .with_max_response_bytes(64);
     let credential = Credential {
         challenge: Challenge {

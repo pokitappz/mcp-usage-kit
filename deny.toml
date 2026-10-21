@@ -38,7 +38,18 @@ allow = [
     "BSL-1.0",             # xxhash-rust, reached through sqlx
 ]
 confidence-threshold = 0.93
-exceptions = []
+# Scoped to the one crate that needs each, rather than allowed tree-wide. Both
+# are reached only from the separately checked binding and fuzz manifests.
+exceptions = [
+    # pyo3-build-config, building the Python binding.
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "target-lexicon" },
+    # libFuzzer's own sources, in the fuzz harness only.
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
+
+# The fuzz harness is `publish = false` and carries no license of its own.
+[licenses.private]
+ignore = true
 
 [bans]
 # Deliberately a warning, not an error. The resolved graph carries 14 duplicated

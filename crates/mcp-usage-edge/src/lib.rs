@@ -19,5 +19,8 @@
 pub mod admission;
 pub mod config;
 pub mod control_plane;
+pub mod endpoint;
 pub mod mpp;
 pub mod proxy;
+pub mod replay;
+pub mod transport;

@@ -24,12 +24,12 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// The file is not valid TOML, or does not match the schema.
-    #[error("cannot parse {path}: {source}")]
+    #[error("cannot parse {path}: invalid TOML or configuration field")]
     Parse {
         /// Path that was attempted.
         path: String,
-        /// Underlying deserialization failure.
-        source: toml::de::Error,
+        /// Byte range of the invalid field, without its contents.
+        span: Option<std::ops::Range<usize>>,
     },
     /// `upstream.url` is not an absolute URL with a host.
     #[error("upstream.url must be an absolute http(s) URL with a host, got {0:?}")]
@@ -110,6 +110,12 @@ pub enum ConfigError {
          or remove the section"
     )]
     TaskStoreUnsupported,
+    /// Invalid transport origin or resource limit.
+    #[error("invalid transport origin or resource limit")]
+    Transport,
+    /// Missing or invalid shared payment replay configuration.
+    #[error("payments require the redis feature and a valid shared replay store")]
+    ReplayStore,
 }
 
 /// A parsed sidecar configuration.
@@ -210,6 +216,8 @@ impl TaskStoreSettings {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MppSettings {
+    /// Shared replay store. Required whenever payments are enabled.
+    pub replay_store: ReplayStoreSettings,
     /// Protection space advertised in the challenge.
     pub realm: String,
     /// Lowercase payment method identifier, such as `tempo` or `usdc`.
@@ -226,9 +234,6 @@ pub struct MppSettings {
     /// How long a challenge stays answerable.
     #[serde(default = "default_challenge_ttl_seconds")]
     pub challenge_ttl_seconds: u64,
-    /// How many spent proofs to remember.
-    #[serde(default = "default_replay_capacity")]
-    pub replay_capacity: usize,
     /// Where proofs are verified.
     pub facilitator: FacilitatorSettings,
 }
@@ -258,10 +263,6 @@ const fn default_challenge_ttl_seconds() -> u64 {
     300
 }
 
-const fn default_replay_capacity() -> usize {
-    100_000
-}
-
 const fn default_facilitator_timeout_seconds() -> u64 {
     20
 }
@@ -283,7 +284,7 @@ impl MppSettings {
     pub fn secret(&self) -> Result<Vec<u8>, ConfigError> {
         std::env::var(&self.secret_env)
             .ok()
-            .filter(|value| !value.is_empty())
+            .filter(|value| value.len() >= 32)
             .map(String::into_bytes)
             .ok_or_else(|| ConfigError::MppSecretMissing(self.secret_env.clone()))
     }
@@ -345,6 +346,18 @@ impl Upstream {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeSettings {
+    /// Maximum accepted simultaneous TCP connections.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Total time to read request headers.
+    #[serde(default = "default_header_timeout")]
+    pub header_timeout_seconds: u64,
+    /// Total time to read a request body; response streams have no such deadline.
+    #[serde(default = "default_body_timeout")]
+    pub body_timeout_seconds: u64,
+    /// Exact HTTP(S) origins allowed when an Origin header is supplied.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
     /// Maximum time for active connections, deferred accounting and final exports.
     #[serde(default = "default_shutdown_timeout_seconds")]
     pub shutdown_timeout_seconds: u64,
@@ -358,10 +371,8 @@ pub struct EdgeSettings {
     pub strict_protocol_version: bool,
     /// Forward the caller's credential to the upstream server.
     ///
-    /// Defaults to `true` here, unlike the library, because in a sidecar the
-    /// upstream is someone else's already-authenticated MCP server. Turning
-    /// this off silently breaks their auth.
-    #[serde(default = "default_true")]
+    /// Disabled by default. Enable only for an upstream trusted with tenant keys.
+    #[serde(default)]
     pub credential_forwarding: bool,
     /// Largest request body the meter will buffer.
     #[serde(default)]
@@ -379,7 +390,7 @@ pub struct EdgeSettings {
     ///
     /// Worth setting on an internet-facing sidecar. It is not per-client
     /// limiting, which needs a client identity the meter cannot trust.
-    #[serde(default)]
+    #[serde(default = "default_auth_limit")]
     pub auth_failure_limit: Option<AuthFailureLimitSettings>,
 }
 
@@ -396,12 +407,16 @@ impl Default for EdgeSettings {
         Self {
             strict_protocol_version: false,
             shutdown_timeout_seconds: default_shutdown_timeout_seconds(),
-            credential_forwarding: true,
+            credential_forwarding: false,
+            max_connections: default_max_connections(),
+            header_timeout_seconds: default_header_timeout(),
+            body_timeout_seconds: default_body_timeout(),
+            allowed_origins: Vec::new(),
             max_request_body_bytes: None,
             max_response_capture_bytes: None,
             meter_name: None,
             cache: None,
-            auth_failure_limit: None,
+            auth_failure_limit: default_auth_limit(),
         }
     }
 }
@@ -568,7 +583,7 @@ impl ControlPlaneSettings {
 }
 
 /// One statically configured tenant.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantConfig {
     /// Stable internal identifier.
@@ -628,7 +643,7 @@ impl Config {
         })?;
         let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
-            source,
+            span: source.span(),
         })?;
         config.validate()?;
         Ok(config)
@@ -636,14 +651,16 @@ impl Config {
 
     /// Reject configurations that would fail confusingly at runtime.
     fn validate(&self) -> Result<(), ConfigError> {
-        let uri: http::Uri = self
-            .upstream
-            .url
-            .parse()
-            .map_err(|_| ConfigError::UpstreamUrl(self.upstream.url.clone()))?;
-        if uri.host().is_none() || uri.scheme().is_none() {
-            return Err(ConfigError::UpstreamUrl(self.upstream.url.clone()));
+        crate::endpoint::validate(&self.upstream.url, true)
+            .map_err(|_| ConfigError::UpstreamUrl("[REDACTED]".into()))?;
+        if self.edge.max_connections == 0 || self.edge.header_timeout_seconds == 0 {
+            return Err(ConfigError::Transport);
         }
+        crate::transport::TransportLayer::new(
+            self.edge.allowed_origins.clone(),
+            Duration::from_secs(self.edge.body_timeout_seconds),
+        )
+        .map_err(|_| ConfigError::Transport)?;
         if let Some(limit) = &self.edge.auth_failure_limit
             && limit.window_seconds == 0
         {
@@ -656,13 +673,8 @@ impl Config {
         }
 
         if let Some(plane) = &self.control_plane {
-            let uri: http::Uri = plane
-                .url
-                .parse()
-                .map_err(|_| ConfigError::PlaneUrl(plane.url.clone()))?;
-            if uri.host().is_none() || uri.scheme().is_none() {
-                return Err(ConfigError::PlaneUrl(plane.url.clone()));
-            }
+            crate::endpoint::validate(&plane.url, false)
+                .map_err(|_| ConfigError::PlaneUrl("[REDACTED]".into()))?;
             // A budget at or below the refresh interval turns one missed poll
             // into a full outage, which is the opposite of what it is for.
             if plane.max_stale_seconds <= plane.refresh_interval_seconds {
@@ -689,24 +701,13 @@ impl Config {
             if mpp.challenge_ttl_seconds == 0 {
                 return Err(ConfigError::ZeroChallengeTtl);
             }
-            let uri: http::Uri = mpp
-                .facilitator
-                .url
-                .parse()
-                .map_err(|_| ConfigError::FacilitatorUrl(mpp.facilitator.url.clone()))?;
-            let loopback = uri
-                .host()
-                .and_then(|host| {
-                    host.trim_matches(|c| c == '[' || c == ']')
-                        .parse::<std::net::IpAddr>()
-                        .ok()
-                })
-                .is_some_and(|address| address.is_loopback());
-            // A facilitator sees payment proofs, so plaintext is only ever
-            // acceptable to a loopback test server.
-            if uri.host().is_none() || (uri.scheme_str() != Some("https") && !loopback) {
-                return Err(ConfigError::FacilitatorUrl(mpp.facilitator.url.clone()));
+            crate::endpoint::validate(&mpp.facilitator.url, false)
+                .map_err(|_| ConfigError::FacilitatorUrl("[REDACTED]".into()))?;
+            if mpp.replay_store.timeout_seconds == 0 {
+                return Err(ConfigError::ReplayStore);
             }
+            #[cfg(not(feature = "redis"))]
+            return Err(ConfigError::ReplayStore);
         }
 
         if let Some(store) = &self.task_store {
@@ -736,13 +737,8 @@ impl Config {
         let mut resolved = Vec::with_capacity(self.tenants.len());
         for entry in &self.tenants {
             let key = entry.resolve_key()?;
-            if let Some(existing) = seen.insert(key.clone(), entry.id.clone()) {
-                tracing::error!(
-                    tenant = %entry.id,
-                    conflicts_with = %existing,
-                    "duplicate API key"
-                );
-                return Err(ConfigError::DuplicateTenantKey(entry.id.clone()));
+            if seen.insert(key.clone(), entry.id.clone()).is_some() {
+                return Err(ConfigError::DuplicateTenantKey("[REDACTED]".into()));
             }
             resolved.push((key, entry.tenant()));
         }
@@ -789,10 +785,9 @@ api_key = "{STRONG_KEY}"
         let config = parse(&minimal("")).expect("parses");
         config.validate().expect("valid");
 
-        // Credential forwarding defaults ON in the sidecar. The upstream is
-        // someone else's authenticated server; dropping the caller's
-        // credential would break it.
-        assert!(config.edge.credential_forwarding);
+        // Credential forwarding defaults OFF: the tenant's key is only handed
+        // to an upstream the operator has explicitly chosen to trust with it.
+        assert!(!config.edge.credential_forwarding);
         // Strict mode stays OFF by default: turning it on would 400 every
         // client that predates the mirrored headers.
         assert!(!config.edge.strict_protocol_version);
@@ -887,7 +882,7 @@ url = "http://127.0.0.1:3000"
         let config = parse(&text).expect("parses");
         let store = config.task_store.expect("present");
         assert_eq!(store.key_prefix, "mcp-usage");
-        assert_eq!(store.ttl(), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(store.ttl(), Duration::from_hours(24));
         assert_eq!(store.timeout(), Duration::from_secs(2));
     }
 
@@ -937,5 +932,62 @@ api_key = "{STRONG_KEY}"
         assert_eq!(resolved[0].0, STRONG_KEY);
         assert_eq!(resolved[0].1.id, "acme");
         assert_eq!(resolved[0].1.billing_customer_id, "cus_acme");
+    }
+}
+
+impl std::fmt::Debug for TenantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantConfig")
+            .field("credentials", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+const fn default_max_connections() -> usize {
+    128
+}
+const fn default_header_timeout() -> u64 {
+    10
+}
+const fn default_body_timeout() -> u64 {
+    30
+}
+// A serde default for an optional section, so it has to return the `Option`.
+#[allow(clippy::unnecessary_wraps)]
+const fn default_auth_limit() -> Option<AuthFailureLimitSettings> {
+    Some(AuthFailureLimitSettings {
+        max_failures: 100,
+        window_seconds: 60,
+    })
+}
+
+/// Redis connection used exclusively for shared payment replay protection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayStoreSettings {
+    /// Environment variable containing a Redis URL (rediss for remote endpoints).
+    pub url_env: String,
+    /// Namespace shared by all replicas of this payment issuer.
+    #[serde(default = "default_replay_prefix")]
+    pub key_prefix: String,
+    /// Maximum time for a Redis operation.
+    #[serde(default = "default_task_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+fn default_replay_prefix() -> String {
+    "mcp-usage-payments-v1".into()
+}
+
+impl ReplayStoreSettings {
+    /// Resolve the URL without putting credentials in errors.
+    ///
+    /// # Errors
+    /// Returns a sanitized error for a missing or empty variable.
+    pub fn url(&self) -> Result<String, ConfigError> {
+        std::env::var(&self.url_env)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or(ConfigError::ReplayStore)
     }
 }

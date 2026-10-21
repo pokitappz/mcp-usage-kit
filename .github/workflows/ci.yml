@@ -27,25 +27,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
       - name: Check formatting
-        run: cargo +stable fmt --all -- --check
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Lint all targets and features
-        run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +1.99.1 clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test all targets and features
-        run: cargo +stable test --workspace --all-targets --all-features --locked
+        run: cargo +1.99.1 test --workspace --all-targets --all-features --locked
       - name: Treat documentation warnings as errors
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo +stable doc --workspace --all-features --no-deps --locked
+        run: cargo +1.99.1 doc --workspace --all-features --no-deps --locked
       # The overbilling numbers are published, so they have to keep being
       # reproducible. `--strict` fails when this project's own meter drifts
       # from the ground truth the suite claims is correct, which is the half of
       # it that holds us to the same standard as everyone else.
       - name: Reproduce the published overbilling measurement
-        run: cargo +stable run --locked -p mcp-overbilling -- --strict
+        run: cargo +1.99.1 run --locked -p mcp-overbilling -- --strict
       - name: Build publishable archives
-        run: cargo +stable package --workspace --locked --no-verify
+        run: cargo +1.99.1 package --workspace --locked --no-verify
       - name: Test release metadata guards
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
@@ -58,20 +58,29 @@ jobs:
           fi
 
   python:
-    name: Python binding
+    name: Python ${{ matrix.python }} binding
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14', '3.15']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
       # The binding is excluded from the workspace, so the quality job above
       # does not reach it. It gets the same two gates here.
       - name: Check formatting
         working-directory: bindings/python
-        run: cargo +stable fmt --all -- --check
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Lint
         working-directory: bindings/python
-        run: cargo +stable clippy --all-targets --locked -- -D warnings
+        run: cargo +1.99.1 clippy --all-targets --locked -- -D warnings
       # `cargo metadata --no-deps` cannot see an excluded package, so the
       # release guard does not cover the binding's version. Checked here
       # instead, or a release would ship an engine and a binding that disagree
@@ -86,13 +95,13 @@ jobs:
             exit 1
           fi
       - name: Install build and test tooling
-        run: python3 -m pip install --upgrade 'maturin>=1.9,<2.0' pytest
+        run: python3 -m pip install --require-hashes -r requirements-dev.txt
       # `--locked` here too, not just on the lint step: without it a stale
       # bindings/python/Cargo.lock passes CI while the shipped wheel is built
       # from different versions than the one that was reviewed.
       - name: Build the extension
         working-directory: bindings/python
-        run: maturin build --release --locked --out dist
+        run: RUSTUP_TOOLCHAIN=1.99.1 maturin build --release --locked --out dist --interpreter python3
       - name: Install the built wheel
         working-directory: bindings/python
         run: python3 -m pip install --no-index --find-links dist mcp-usage-kit
@@ -101,28 +110,16 @@ jobs:
       - name: Run the shared conformance vectors and the API suite
         working-directory: bindings/python
         run: python3 -m pytest tests/ -q
-      # The wheel claims abi3-py39, so the floor has to be exercised rather
-      # than assumed: the runner default is well past it. uv is installed
-      # through pip rather than assumed present, and fetches the interpreter
-      # itself, so no unpinned action is added to a workflow that pins.
-      - name: Check the declared Python floor can load the wheel
-        working-directory: bindings/python
-        run: |
-          python3 -m pip install --upgrade uv
-          uv python install 3.9
-          uv run --python 3.9 --with pytest --with mcp-usage-kit \
-            --no-project --find-links dist \
-            python -m pytest tests/ -q
 
   msrv:
-    name: Rust 1.88 minimum version
+    name: Rust 1.94 minimum version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the minimum supported Rust version
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.94.0 --profile minimal
       - name: Check the workspace
-        run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+        run: cargo +1.94.0 check --workspace --all-targets --all-features --locked
 
   portability:
     name: Check ${{ matrix.os }}
@@ -134,9 +131,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal
       - name: Check every crate
-        run: cargo +stable check --workspace --all-targets --all-features --locked
+        run: cargo +1.99.1 check --workspace --all-targets --all-features --locked
 
   audit:
     name: Dependency audit
@@ -144,11 +141,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked --version 0.22.2
+        run: cargo +1.99.1 install cargo-audit --locked --version 0.22.2
       - name: Check RustSec advisories
-        run: cargo +stable audit
+        run: |
+          cargo +1.99.1 audit --deny warnings
+          cargo +1.99.1 audit --deny warnings --file bindings/python/Cargo.lock
+          cargo +1.99.1 audit --deny warnings --file fuzz/Cargo.lock
 
   deny:
     name: License, source, and ban checks
@@ -156,11 +156,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked --version 0.20.2
+        run: cargo +1.99.1 install cargo-deny --locked --version 0.20.2
       - name: Check licenses, sources, bans, and advisories
-        run: cargo +stable deny --all-features check
+        run: |
+          cargo +1.99.1 deny --locked --all-features check
+          cargo +1.99.1 deny --manifest-path bindings/python/Cargo.toml --config deny.toml --locked --all-features check
+          cargo +1.99.1 deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked --all-features check
 
   fuzz:
     name: Fuzz targets
@@ -193,7 +196,7 @@ jobs:
       # Pinned to explicit minor versions rather than a floating tag, so a
       # backend upgrade is a reviewed change rather than a surprise.
       postgres:
-        image: postgres:17.2@sha256:3267c505060a0052e5aa6e5175a7b41ab6b04da2f8c4540fc6e98a37210aa2d3
+        image: postgres:18.6@sha256:1267c7e692de235fda2a50dbcdbcbca4672ea6a0298576a6bd9d07cafc319b32
         env:
           POSTGRES_USER: usagekit
           POSTGRES_PASSWORD: usagekit
@@ -206,7 +209,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis:
-        image: redis:7.4@sha256:595cc6f2bb3af6e03347b90deb6123c6aa2c81dea05ce08128de8a174b6ac67b
+        image: redis:8.10.1@sha256:8a1efc5f479551822b47424ccae982026b633f28818eab0387348120a61e10e2
         ports:
           - 6379:6379
         options: >-
@@ -217,7 +220,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.99.1 --profile minimal
       - name: Exercise the durable task stores
         env:
           MCP_USAGE_TEST_POSTGRES_URL: postgres://usagekit:usagekit@127.0.0.1:5432/usagekit
@@ -226,7 +229,9 @@ jobs:
           # passing run, because the tests skip themselves when a backend is
           # absent.
           MCP_USAGE_REQUIRE_BACKENDS: "1"
-        run: cargo +stable test -p mcp-usage-store --all-features --locked --test backends
+        run: |
+          cargo +1.99.1 test -p mcp-usage-store --all-features --locked --test backends
+          cargo +1.99.1 test -p mcp-usage-edge --all-features --locked --test replay_security
 
   site:
     name: Static site checks

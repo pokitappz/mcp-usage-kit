@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Build context is the WORKSPACE ROOT, not this directory:
 #   docker build -f crates/mcp-usage-edge/Dockerfile .
@@ -6,7 +6,7 @@
 # Build stage
 # Pinned to the Debian release the runtime stage is built from, so the glibc the
 # binary is linked against matches the one it runs on.
-FROM rust:1.96-slim-bookworm AS builder
+FROM rust:1.99.1-slim-trixie@sha256:e6cd1d294a300601eaaa4a294b337e5f0826f427fb2d481e9f76e69e7981e244 AS builder
 
 # cmake, clang and a linker are aws-lc-sys build inputs, pulled in by the `tls`
 # feature. A sidecar that only ever fronts a loopback or private-network
@@ -29,7 +29,7 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release --locked -p mcp-usage-edge \
+    cargo build --release --locked -p mcp-usage-edge --features redis \
  && mkdir -p /out \
  && cp target/release/mcp-usage-edge /out/mcp-usage-edge
 
@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # distroless/cc is glibc + libgcc and nothing else: no shell, no package
 # manager, no coreutils. Root certificates come with the image, which is what
 # an https upstream needs.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
 
 COPY --from=builder /out/mcp-usage-edge /usr/local/bin/mcp-usage-edge
 COPY crates/mcp-usage-edge/edge.example.toml /etc/mcp-usage-edge/edge.toml

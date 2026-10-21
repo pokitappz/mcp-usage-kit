@@ -536,7 +536,7 @@ mod postgres_backend {
             .connect(&url)
             .await
             .expect("connect to PostgreSQL");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin)
             .await
             .expect("create scratch schema");
@@ -566,7 +566,7 @@ mod postgres_backend {
         }
         let outcome = futures_collect(booting).await;
 
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin)
             .await
             .expect("drop scratch schema");

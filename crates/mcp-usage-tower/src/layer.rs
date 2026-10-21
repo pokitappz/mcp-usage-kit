@@ -39,7 +39,7 @@ pub type BoxError = Box<dyn StdError + Send + Sync>;
 pub type MeterBody = UnsyncBoxBody<Bytes, BoxError>;
 
 const DEFAULT_CACHE_ENTRIES: usize = 512;
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_hours(24);
 /// Terminal accounting parked for want of somewhere to await.
 const DEFAULT_DEFERRED_CAPACITY: usize = 4_096;
 /// Parked completions run at the start of each request.

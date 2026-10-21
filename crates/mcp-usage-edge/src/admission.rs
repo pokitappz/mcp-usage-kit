@@ -176,6 +176,7 @@ fn refuse_quota(reason: LimitReason) -> Response<MeterBody> {
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
+    crate::transport::secure_headers(&mut response);
     response
 }
 
@@ -192,6 +193,7 @@ fn refuse_payment(
 ) -> Response<MeterBody> {
     let challenge = payments.challenge(
         priced.amount_minor,
+        &priced.tenant,
         (&priced.method, &priced.name),
         body,
         &Rfc3339::now(),
@@ -217,6 +219,7 @@ fn refuse_payment(
     if let Ok(value) = http::HeaderValue::from_str(&challenge.header_value()) {
         headers.insert(http::header::WWW_AUTHENTICATE, value);
     }
+    crate::transport::secure_headers(&mut response);
     response
 }
 
@@ -229,6 +232,7 @@ fn too_large() -> Response<MeterBody> {
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
+    crate::transport::secure_headers(&mut response);
     response
 }
 
@@ -246,6 +250,7 @@ enum Verdict {
 /// derived from the identity, so a credential bought under one identity must
 /// not be redeemable under another.
 struct Priced {
+    tenant: String,
     method: String,
     name: String,
     amount_minor: u64,
@@ -275,6 +280,7 @@ impl<S> AdmissionService<S> {
             .prices
             .units_for(&classified.call.method, classified.call.name.as_deref());
         Some(Priced {
+            tenant: tenant.id.clone(),
             method,
             name,
             amount_minor: minor_units(units, unit_price_micros)?,
@@ -321,6 +327,7 @@ impl<S> AdmissionService<S> {
             match payments
                 .verify(
                     value,
+                    &priced.tenant,
                     body,
                     (&priced.method, &priced.name),
                     priced.amount_minor,
@@ -339,6 +346,12 @@ impl<S> AdmissionService<S> {
                 // carried so that if quota does refuse, the answer names what
                 // was actually wrong with the credential rather than the
                 // generic "payment required".
+                Err(PaymentError::Unavailable) => {
+                    return Verdict::Refuse(Box::new(crate::transport::rejection(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "payment_verification_unavailable",
+                    )));
+                }
                 Err(error) => {
                     tracing::info!(
                         problem = %error.problem_type(),
@@ -395,6 +408,7 @@ fn bad_request(code: &str) -> Response<MeterBody> {
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
+    crate::transport::secure_headers(&mut response);
     response
 }
 

@@ -5,7 +5,7 @@ publish = false
 edition = "2024"
 
 # Deliberately outside the main workspace. libFuzzer requires a nightly
-# toolchain, and the workspace is built and tested on stable against a 1.88
+# toolchain, and the workspace is built and tested on stable against a 1.94
 # minimum, so pulling this in would force nightly on every ordinary build.
 [workspace]
 
@@ -13,9 +13,9 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "0.4.13"
 mcp-usage-core = { path = "../crates/mcp-usage-core" }
-serde_json = "1"
+serde_json = "1.0.154"
 
 [[bin]]
 name = "name_sentinel"
