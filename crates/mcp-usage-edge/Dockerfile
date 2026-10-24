@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # distroless/cc is glibc + libgcc and nothing else: no shell, no package
 # manager, no coreutils. Root certificates come with the image, which is what
 # an https upstream needs.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 
 COPY --from=builder /out/mcp-usage-edge /usr/local/bin/mcp-usage-edge
 COPY crates/mcp-usage-edge/edge.example.toml /etc/mcp-usage-edge/edge.toml
