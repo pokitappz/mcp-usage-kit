@@ -3,4 +3,4 @@ maturin==1.15.0
 pytest==9.1.1
 uv==0.13.4
 pip-audit==2.10.1
-zizmor==1.31.1
+zizmor==1.32.0
