@@ -6,7 +6,7 @@
 # Build stage
 # Pinned to the Debian release the runtime stage is built from, so the glibc the
 # binary is linked against matches the one it runs on.
-FROM rust:1.99.1-slim-trixie@sha256:e6cd1d294a300601eaaa4a294b337e5f0826f427fb2d481e9f76e69e7981e244 AS builder
+FROM rust:1.100.0-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
 
 # cmake, clang and a linker are aws-lc-sys build inputs, pulled in by the `tls`
 # feature. A sidecar that only ever fronts a loopback or private-network
